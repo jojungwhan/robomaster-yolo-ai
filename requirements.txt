@@ -1,0 +1,7 @@
+numpy
+opencv-python
+mss
+pyttsx3
+sounddevice
+ultralytics
+openai

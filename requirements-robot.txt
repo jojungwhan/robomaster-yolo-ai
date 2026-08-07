@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Official PC SDK (documented for EP/EP Core). S1 requires a separately validated
+# compatible driver exposing the same Python API.
+robomaster
