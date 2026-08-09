@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import queue
 import tempfile
 from pathlib import Path
@@ -211,10 +212,10 @@ class RuntimeFailureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             app.shutdown_event.clear()
             app.cloud_available.clear()
-            with (
+            patchers = (
                 mock.patch.object(app, "create_openai_client", return_value=(None, RuntimeError("no key"))),
                 mock.patch.object(app, "YOLO", FakeYolo),
-                mock.patch.object(app.mss, "MSS", return_value=FakeMSS()),
+                mock.patch.object(app, "create_screen_capture", return_value=FakeMSS()),
                 mock.patch.object(app, "speech_worker", return_value=None),
                 mock.patch.object(app, "preview_window_is_visible", return_value=False),
                 mock.patch.object(app, "exclude_preview_from_capture"),
@@ -228,7 +229,10 @@ class RuntimeFailureTests(unittest.TestCase):
                 mock.patch.object(app.cv2, "destroyAllWindows"),
                 mock.patch.object(app.sd, "query_devices", side_effect=RuntimeError("no mic")),
                 mock.patch.object(app.sd, "stop"),
-            ):
+            )
+            with ExitStack() as stack:
+                for patcher in patchers:
+                    stack.enter_context(patcher)
                 app.main(
                     [
                         "--disable-lego-model",

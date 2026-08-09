@@ -4,6 +4,8 @@ __pycache__/
 .env.*
 !.env.example
 .venv/
+.venv-robot/
+.venv-robot.*/
 venv/
 *.log
 mission_events.jsonl
