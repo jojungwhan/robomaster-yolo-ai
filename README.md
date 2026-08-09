@@ -1,431 +1,350 @@
-# RoboMaster Classroom Mission System
+# RoboMaster Systems Fundamentals
 
-A safety-gated RoboMaster S1/EP classroom project that combines full-frame screen
-capture, YOLO object detection, LEGO recognition, voice conversation, text-to-speech,
-mission scenarios, autonomous navigation states, and an OpenCV operator dashboard.
+A small, step-by-step Python project for learning how a computer system works
+through a robot.
 
-Public repository: https://github.com/jojungwhan/robomaster-yolo-ai
+This edition focuses on **input, process, working memory, output, feedback,
+wireless communication, encryption, computer vision, AI, and AI agents**. It is
+not a search-and-rescue application or an autonomous mission planner.
 
-> **Safety boundary:** the software reduces risk but cannot guarantee that a robot will
-> never contact a wall or person. Camera detections are not collision sensors. Keep a
-> teacher at the controls, use the emergency stop, validate every ToF direction, test
-> with wheels raised first, and never operate near stairs or an unbounded edge.
+The laptop code is observation-only: every example keeps the chassis output at
+`STOP`. A separate RoboMaster S1 Lab example makes state visible with the
+robot's LEDs and sound. Test Lab code with the drive wheels raised and a teacher
+at the controls.
 
-## What is included
+The previous mission-oriented implementation is recoverable in Git history at
+commit `2f54bc7`.
 
-- Full monitor capture fitted into the dashboard without cropping or stretching.
-- YOLOv8n detection for the 80 COCO object classes, with boxes, confidence, and a
-  visible object list.
-- Persistent, instance-level target lock: two-frame confirmation, short missed-frame
-  hold, distractor rejection, bounded reacquisition, and visual close-target stop.
-- Optional camera-gimbal tracking that is separate from chassis steering.
-- Eleven data-driven classroom missions loaded from `scenarios.json`.
-- An explicit navigation state machine with scan sweeps, timeouts, patrol, obstacle
-  recovery, target approach, interaction stop, waypoint navigation, completion, and
-  emergency-stop states.
-- Four-direction ToF display, low-speed safety controller, command watchdog, impact
-  latch, visual person clearance, and fail-closed SDK error handling.
-- Odometry trail, range-derived obstacle points, named waypoints, mission-map save and
-  resume, and return to the recorded home position.
-- OpenCV classroom dashboard with scenario cards, clickable detections, captions,
-  connection indicators, event timeline, map, teacher/student roles, and mouse controls.
-- Local text-to-speech for prompts and detected-object reading, including mute, rate,
-  and volume controls.
-- Push-to-talk speech-to-text and multi-turn OpenAI conversation, with separate history
-  for each scenario.
-- Experimental `Lego-Identification` labels, colored-brick candidates, ArUco targets,
-  and a semantic red LEGO cross for “help needed.”
-- Local-only startup when no OpenAI API key is configured.
+## Learn in this order
+
+```mermaid
+flowchart LR
+    S1["1 · Input and output"] --> S2["2 · Process"]
+    S2 --> S3["3 · Working memory"]
+    S3 --> S4["4 · Feedback"]
+    S4 --> S5["5 · Wireless messages"]
+    S5 --> S6["6 · Encryption"]
+    S6 --> S7["7 · Computer vision and AI"]
+    S7 --> S8["8 · AI agent loop"]
+```
+
+| Step | Run | Question answered | Robot illustration |
+| --- | --- | --- | --- |
+| 1 | `python -m steps.step_01_input_output` | What enters and leaves a system? | distance/button in; LED, screen, sound, and STOP out |
+| 2 | `python -m steps.step_02_process` | What does Python do with raw values? | centimetres become UNKNOWN, NEAR, or CLEAR |
+| 3 | `python -m steps.step_03_memory` | Why remember a previous tick? | repeated or stale sensor sequences are not treated as new |
+| 4 | `python -m steps.step_04_feedback` | Why read the world again after acting? | the next sensor reading checks what changed |
+| 5 | `python -m steps.step_05_wireless` | How does data cross the air? | a named message becomes bytes; delay or loss produces HOLD/STOP |
+| 6 | `python -m steps.step_06_encryption` | How can people on the link be kept from reading or changing data? | a message is locked; changed encrypted bytes are rejected |
+| 7 | `python -m steps.step_07_vision_ai` | How are computer vision and AI different? | a pixel rule is compared with an uncertain model prediction |
+| 8 | `python -m steps.step_08_agent` | What makes an AI agent a system? | observe, remember, decide, output, and observe again |
+
+Do not skip directly to the agent. An agent is understandable only after every
+smaller box is understandable.
+
+## The whole computer system
+
+```mermaid
+flowchart LR
+    I["INPUT<br/>button · distance · camera frame"] --> P["PROCESS<br/>Python checks and transforms values"]
+    P --> M[("WORKING MEMORY<br/>last sequence · recent frames")]
+    M --> D{"DECIDE<br/>rules + risk policy"}
+    D --> O["OUTPUT<br/>LED · screen · sound · chassis STOP"]
+    O --> F["FEEDBACK<br/>next observation"]
+    F --> I
+    AI["AI MODEL<br/>label + confidence"] -. "uncertain observation" .-> D
+    H["HUMAN + SAFETY<br/>may reject a proposal"] --> D
+```
+
+- **Input** is data entering the boundary.
+- **Process** changes or checks that data.
+- **Working memory** is temporary state used by the next tick.
+- **Decision** selects an allowed output.
+- **Output** is a visible, audible, stored, or physical effect.
+- **Feedback** is new input showing what happened.
+
+Python connects all six. Python is a programming language; it is not itself AI.
+
+## One Python tick
+
+```mermaid
+sequenceDiagram
+    participant World
+    participant Python
+    participant Memory
+    participant Policy
+    participant Robot
+    World->>Python: RobotInput(sequence, distance, frame_id)
+    Python->>Python: process_input(raw)
+    Python->>Memory: read previous sequence and output
+    Python->>Policy: decide(processed, memory)
+    Policy-->>Python: READY / HOLD / STOP_AND_ALERT
+    Python->>Robot: LED + screen + sound + chassis STOP
+    Robot-->>World: visible output
+    World-->>Python: next fresh input
+```
+
+Open `fundamentals/system.py` and follow the fields in `SystemTrace`. The
+trace exists so a student can point to evidence instead of saying “the robot
+thought.”
+
+## Where code runs
+
+```mermaid
+flowchart LR
+    subgraph Robot["RoboMaster S1"]
+        Camera["camera / armor input"]
+        Lab["S1 Lab Python"]
+        Hardware["LED · sound · gimbal · chassis"]
+        Camera --> Lab --> Hardware
+    end
+    subgraph Air["Wireless boundary"]
+        WiFi["radio + network messages<br/>delay · loss · other listeners"]
+    end
+    subgraph Laptop["Laptop"]
+        App["RoboMaster app"]
+        Course["this Python project<br/>simulation + saved observations"]
+        Screen["trace / diagram / dashboard output"]
+        App --> Course --> Screen
+    end
+    Camera --> WiFi --> App
+    App --> WiFi --> Robot
+```
+
+The RoboMaster app and robot use their own connection protocol. This project
+does not imitate that protocol, open a robot socket, or send motion commands.
+`robot/s1_lab_input_process_memory_output.py` is the separate on-robot
+boundary.
+
+## Working memory is not every kind of storage
+
+```mermaid
+flowchart TB
+    Now["CURRENT INPUT<br/>one distance · one frame"] --> Short["WORKING MEMORY<br/>last sequence · three-frame streak"]
+    Short --> Output["CURRENT OUTPUT<br/>LED / screen / STOP"]
+    File["SAVED FILE<br/>test case · event log"] -. "can be loaded later" .-> Short
+    Weight["MODEL WEIGHTS<br/>patterns learned during training"] -. "used for inference" .-> AI["AI prediction"]
+    Short -. "cleared on restart" .-> Gone["empty memory"]
+```
+
+Model weights are learned parameters, not a diary of the current student or
+room. A log file is stored output, not working memory.
+
+## Wireless communication
+
+A message has meaning inside the application. A radio carries bytes, not Python
+objects or intentions.
+
+```mermaid
+flowchart LR
+    Meaning["Message<br/>kind=STATUS<br/>value=observe"] --> Encode["ENCODE<br/>JSON → UTF-8 bytes"]
+    Encode --> Packet["PACKET<br/>sequence 7"]
+    Packet --> Radio["WIRELESS LINK<br/>delay · loss · interference"]
+    Radio --> Receive{"arrived before timeout?"}
+    Receive -- no --> Safe["HOLD / STOP<br/>do not reuse stale action"]
+    Receive -- yes --> Decode["DECODE + VALIDATE"]
+    Decode --> Meaning2["Message with the same fields"]
+```
+
+`fundamentals/communication.py` uses a deterministic `WirelessLink`
+simulation. It teaches three systems ideas without pretending to be a real
+radio driver:
+
+1. **Latency:** a message arrives later.
+2. **Loss:** a message may not arrive.
+3. **Freshness:** sequence numbers keep an old packet from becoming a new action.
+
+## Encoding is not encryption
+
+```mermaid
+flowchart TB
+    M["teacher says: observe-only"]
+    M --> J["JSON ENCODING<br/>organized and still readable"]
+    J --> E["ENCRYPTION<br/>readable bytes + secret key → ciphertext"]
+    E --> C["CIPHERTEXT ON THE LINK<br/>unreadable without the key"]
+    C --> A{"AUTHENTICATION CHECK<br/>were bytes changed?"}
+    A -- changed / wrong key --> R["REJECT"]
+    A -- valid --> U["DECRYPT + DECODE<br/>original message"]
+```
+
+Think of the layers this way:
+
+- **Encoding** is writing the same message in a standard form.
+- **Encryption** is putting it in a locked box so outsiders cannot read it.
+- **Authentication/integrity** is a tamper-evident seal and sender check.
+- **Authorization** is the rule deciding what an identified sender may do.
+
+```mermaid
+flowchart LR
+    K["SECRET KEY<br/>kept out of Git"] --> Lock["LOCK"]
+    P["PLAINTEXT"] --> Lock
+    Lock --> C["CIPHERTEXT"]
+    C --> Air["WIRELESS / INTERNET"]
+    Air --> Unlock["UNLOCK + VERIFY"]
+    K --> Unlock
+    Unlock --> P2["VALID PLAINTEXT"]
+    Fake["changed bytes / wrong key"] --> Unlock
+    Unlock --> Reject["REJECT INVALID"]
+```
+
+The demo uses the maintained `cryptography` library's Fernet format. It
+provides authenticated symmetric encryption for this classroom message. It is
+not a replacement for network security.
+
+### Security is layered
+
+```mermaid
+flowchart TB
+    Person["PERSON<br/>teacher / student"] --> Permission["AUTHORIZATION<br/>who may change a mode?"]
+    Permission --> AppLock["APPLICATION MESSAGE<br/>Fernet demo when needed"]
+    AppLock --> TLS["INTERNET SERVICE<br/>HTTPS / TLS"]
+    TLS --> WiFi["LOCAL RADIO LINK<br/>trusted WPA2/WPA3 classroom network"]
+    WiFi --> Device["DEVICE<br/>updated app · no shared public password"]
+```
+
+Rules for students:
+
+- Never invent a cipher for real protection.
+- Never commit, print, screenshot, or chat a secret key.
+- A Wi-Fi password does not decide which app user is a teacher.
+- Encryption does not make a dangerous command safe.
+- If a message is missing, late, malformed, changed, or unauthorized, use a
+  non-moving output.
+
+## Computer vision is not always AI
+
+```mermaid
+flowchart LR
+    Pixels["PIXELS<br/>0–255 numbers"] --> CV["COMPUTER VISION<br/>measure or transform images"]
+    CV --> Rule["WRITTEN RULE<br/>count pixels above 200"]
+    CV --> Model["LEARNED AI MODEL<br/>patterns from training examples"]
+    Rule --> Measure["bright fraction 0.33"]
+    Model --> Prediction["person 0.36<br/>bottle 0.74"]
+    Prediction --> Python["PYTHON POLICY<br/>class + score + fresh frames + risk"]
+    Python --> Output["SAFE OUTPUT"]
+```
+
+`measure_bright_region` is computer vision with an explicit pixel rule.
+`AIPrediction` represents output from a learned model. The project uses
+saved predictions so the fundamentals run without downloading a large model.
+An AI adapter can be added later without changing the system interfaces.
+
+## Confidence is not certainty
+
+The numbers below are comparison values for class, not production defaults.
+Real thresholds require fixed validation data from the actual camera, lighting,
+distance, and student environment.
+
+```mermaid
+flowchart TB
+    P["AI observation<br/>label + confidence + frame id"] --> IsPerson{"label is person?"}
+    IsPerson -- "yes; score ≥ 0.30" --> Protect["STOP + RED LED + ALERT<br/>protective output only"]
+    IsPerson -- no --> Strong{"score ≥ 0.70<br/>and 3 fresh frames?"}
+    Strong -- no --> Hold["HOLD + OBSERVE"]
+    Strong -- yes --> Confirm["SHOW OBJECT TO TEACHER<br/>still chassis STOP"]
+    Protect --> Gate["INDEPENDENT SAFETY + HUMAN"]
+    Hold --> Gate
+    Confirm --> Gate
+```
+
+A possible person may use a lower threshold because missing a person can cost
+more than an unnecessary stop. Lowering that threshold makes the robot **easier
+to stop**, never easier to approach a person.
+
+## What is an AI agent?
+
+An AI prediction alone is not an agent. An agent has a goal and repeatedly
+observes, remembers, decides, produces an output, and checks what happened.
+
+```mermaid
+flowchart LR
+    Goal["GOAL<br/>observe safely"] --> Observe["OBSERVE<br/>input + AI prediction"]
+    Observe --> Remember[("REMEMBER<br/>fresh frame streak")]
+    Remember --> Decide["DECIDE<br/>Python risk policy"]
+    Decide --> Safety{"SAFETY / HUMAN<br/>allow, replace, or stop"}
+    Safety --> Act["ACT<br/>LED · screen · alert · STOP"]
+    Act --> Feedback["FEEDBACK<br/>new sequence + new frame"]
+    Feedback --> Observe
+```
+
+`RobotAgent` is deliberately hybrid:
+
+- AI supplies an uncertain observation.
+- Python owns memory, thresholds, validation, and orchestration.
+- deterministic safety rules can override the AI path;
+- every output in the laptop project keeps `chassis="STOP"`.
+
+## Project map
+
+```text
+fundamentals/
+  system.py          input → process → memory → decision → output → feedback
+  communication.py   message → bytes → wireless → encryption → validation
+  vision.py          pixel rule, AI prediction, thresholds, fresh-frame memory
+  agent.py           combines the modules into one observable loop
+steps/
+  step_01_...py      run these eight modules in numerical order
+  ...
+robot/
+  s1_lab_...py       separate on-robot Lab Python boundary
+tests/
+  test_system.py
+  test_communication.py
+  test_vision.py
+```
+
+There is no mission catalog, map, autonomous navigation state machine, cloud
+conversation, dashboard framework, third-party model, robot SDK bundle, or
+vendor executable in this fundamentals edition.
 
 ## Quick start
 
-On Windows, the one-time setup script installs the RoboMaster PC application and the
-project's Python dependencies:
+Python 3.10 or newer is recommended.
 
-```powershell
-.\setup.ps1
-.\.venv-robot\Scripts\Activate.ps1
-python robomaster_yolo_ai.py
-```
-
-`setup.ps1` downloads `RoboMaster_x64_Installer_v1.1.5.exe` from the
-[repository-provided Google Drive file](https://drive.google.com/file/d/1KaB71nUmsWfCn3udnFZWmD_qKw3eBObs/view?usp=drive_link),
-verifies its pinned SHA256 and Windows publisher signature, and runs its documented
-Inno Setup unattended installation. Windows may display an administrator approval
-prompt. The installer is never executed if either verification fails, and the setup
-uses `/NORESTART` so it cannot restart the computer automatically.
-
-The same setup also installs a pinned 64-bit Python 3.8.10 runtime when needed,
-creates `.venv-robot`, and runs:
-
-```powershell
-python -m pip install -r requirements-robot.txt
-```
-
-DJI published the Windows RoboMaster SDK only for Python 3.6-3.8. The repository
-therefore keeps an offline, hash-pinned copy of the Python 3.8 SDK wheel and its native
-codec DLLs under `vendor/robomaster-sdk/windows`. It also archives the two prerequisite
-executables from DJI's pinned SDK commit. The DJI-bundled all-in-one VC runtime is
-unsigned, so it is retained only as a recovery artifact and is never run by setup.
-See [`vendor/robomaster-sdk/README.md`](vendor/robomaster-sdk/README.md) for sources,
-hashes, signatures, and exact behavior.
-
-To install or repair only the RoboMaster PC application, run:
-
-```powershell
-.\setup_robomaster_pc.ps1
-```
-
-To create only the local simulation/dashboard environment, with no desktop app or
-robot SDK installation, run `.\setup.ps1 -LocalOnly`. To install the robot SDK but
-skip the RoboMaster PC desktop app, run `.\setup.ps1 -SkipRoboMasterPc`. The equivalent
-manual local-only Python setup is:
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 python -m pip install -r requirements.txt
-python robomaster_yolo_ai.py
+
+python -m steps.step_01_input_output
+python -m steps.step_02_process
+python -m steps.step_03_memory
+python -m steps.step_04_feedback
+python -m steps.step_05_wireless
+python -m steps.step_06_encryption
+python -m steps.step_07_vision_ai
+python -m steps.step_08_agent
+
+python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The first YOLO run may download `yolov8n.pt`. The application starts in dry-run mode,
-opens the scenario menu, and **cannot move physical hardware**. The LEGO checkpoint is
-optional; if it is absent, OpenCV LEGO and ArUco detection remain available.
-
-### RoboMaster PC camera view
-
-Connect the S1/EP in the RoboMaster PC application and place its live camera view on
-the monitor selected by `--screen`. This project analyzes the selected monitor; it does
-not control the RoboMaster PC application's keyboard or mouse input. Keep the Python
-motion backend in its default dry-run mode when the PC application is being used only
-as the camera source.
-
-Cloud vision and conversation are also optional. Set the key only in the current shell
-or another secret manager; never put a real key in source control:
+On Windows PowerShell, activate with:
 
 ```powershell
-$env:OPENAI_API_KEY = "your-key-here"
-python robomaster_yolo_ai.py
+.\.venv\Scripts\Activate.ps1
 ```
 
-Without a key, object detection, scenarios, navigation simulation, the dashboard,
-local TTS, and LEGO OpenCV features still start normally. TALK reports that cloud
-conversation is unavailable instead of crashing the application.
+Steps 1–5 and 7–8 use only the Python standard library. Step 6 installs one
+purpose-built dependency, `cryptography`, instead of implementing a
+homemade cipher.
 
-### Detection classes and performance
+## Teach the same system at three depths
 
-The default `yolov8n.pt` is the small COCO model: it recognizes 80 broad classes such as
-person, chair, bottle, backpack, laptop, TV, book, and cell phone. It does not know every
-classroom item or arbitrary LEGO piece. Supply a compatible custom Ultralytics checkpoint
-to add domain-specific classes:
-
-```powershell
-python robomaster_yolo_ai.py --yolo-model .\models\classroom-best.pt
-```
-
-YOLO latency is displayed at the bottom of the dashboard. On a CPU, reduce the inference
-size and increase the interval; cached boxes keep the UI responsive between inferences:
-
-```powershell
-python robomaster_yolo_ai.py `
-  --yolo-imgsz 416 `
-  --yolo-interval 0.20 `
-  --yolo-confidence 0.25
-```
-
-Use `--yolo-device 0` to select a supported GPU explicitly. Cached detector results carry
-an observation ID, so replaying one result cannot satisfy the multi-frame target-lock
-confirmation by itself.
-
-## Dashboard
-
-The preview is a single resizable mission console rather than several overlapping
-OpenCV windows. It contains:
-
-- the entire captured monitor, letterboxed into the camera panel;
-- exact locked-target highlighting and a center-to-target guide line;
-- robot, ToF, cloud, microphone, and TTS indicators;
-- navigation, target, gimbal, and motion state;
-- detected-object list and click-to-select regions in visual-target missions;
-- four-direction ToF clearance view;
-- odometry, home, waypoints, trail, and recent obstacle points;
-- student/robot captions and a recent event timeline;
-- scenario, speech, mission, safety, and teacher-only controls.
-
-On Windows, the window is placed on top and excluded from the monitor capture where the
-OS supports `SetWindowDisplayAffinity`, preventing recursive preview capture. Closing
-the preview with its title-bar button latches the emergency stop and exits the loop.
-
-If the wrong monitor is captured, select another one:
-
-```powershell
-python robomaster_yolo_ai.py --screen 2
-```
-
-The rendered dashboard adapts down to 960×640. Its default maximum is 1280×840:
-
-```powershell
-python robomaster_yolo_ai.py --dashboard-width 1100 --dashboard-height 700
-```
-
-## Missions
-
-Selecting or changing a mission always stops and disarms motion. A teacher must inspect
-the scene and ToF panel and then arm again.
-
-| Key | Mission | Navigation behavior |
+| Level | Student explanation | Student work |
 | --- | --- | --- |
-| `1` | Exploration Patrol | Slow patrol, obstacle turns, object narration |
-| `2` | Search & Rescue (SDG 3 + 11) | Search for a person/help cross, stop, ask if help is needed |
-| `3` | Target Guidance | Confirm, lock, align, approach, stop at visual threshold |
-| `4` | LEGO Search | Find LEGO pieces, semantic builds, or ArUco markers |
-| `5` | Medical Supply Delivery | Navigate to the active teacher-recorded waypoint |
-| `6` | Recycling Sort (SDG 12) | Select likely recyclables and discuss categories |
-| `7` | Hazard Inspection | Conservative patrol and possible-hazard reporting |
-| `8` | Inventory Search | Patrol with a live classroom object inventory |
-| `9` | Follow the Leader | Person-only target lock with conservative clearance |
-| `0` | LEGO Treasure Hunt | Search for teacher-selected LEGO/ArUco clues |
-| `H` | Return to Base | Navigate toward the recorded mission home position |
+| Upper elementary | “The sensor sends a clue. Python sorts it. Memory keeps the last clue. The robot shows an answer.” | role cards, arrows, LED colors, packet envelopes |
+| Middle school | “A message becomes bytes; sequence numbers detect stale input; a confidence is compared with an output-specific threshold.” | run steps, change values, record traces, draw packet loss |
+| High school | “Typed interfaces separate inference from policy; authenticated encryption protects confidentiality and integrity; tests enforce fail-closed outputs.” | read modules, add boundary tests, compare false positives/negatives, audit key handling |
 
-Profiles are validated at startup. Edit `scenarios.json` or pass another version-1
-profile file:
+The code stays the same. Only the precision of the explanation changes.
 
-```powershell
-python robomaster_yolo_ai.py --scenarios .\my_scenarios.json
-```
+## Safety and privacy boundary
 
-Each profile can set its name, shortcut, objective, difficulty, prompts, navigation
-policy, preferred/allowed targets, LEGO use, motion permission, cloud/microphone
-requirements, and completion condition. Supported navigation policies are `patrol`,
-`rescue`, `target`, `lego`, `waypoint`, `return_home`, and `stationary`. Duplicate IDs,
-shortcuts, target labels, unsupported policies, and inconsistent preferred targets are
-rejected before operation.
-
-## Navigation behavior
-
-```text
-DISARMED / PAUSED
-        |
-        v
-SCAN -> ACQUIRING -> TARGET LOCKED -> APPROACH -> STOP / INTERACT
-  |          |             |             |
-  +----------+--------- RECOVERY <-------+
-
-WAYPOINT / RETURN HOME -> COMPLETE -> DISARMED
-Any safety fault --------------------> ESTOP
-```
-
-Target motion does not follow whichever same-class box has the highest confidence on
-each frame. It maintains one instance using bounding-box overlap, confirms it over
-multiple frames, holds still during a short miss, and scans only after the hold period.
-A distant same-label distractor cannot silently replace the selected target. The scan
-alternates direction and stops after its timeout.
-
-The approach planner stops before advancing when the selected box reaches the configured
-close-height ratio. The safety controller independently blocks movement using ToF and
-person-clearance checks. Reaching a waypoint or home sends zero motion and disarms.
-
-The mission map is intentionally lightweight, not SLAM or an A* global planner. It uses
-RoboMaster odometry and recent ToF endpoints for operator awareness, then drives directly
-toward a waypoint with obstacle recovery. Odometry can drift; return-to-base is therefore
-an approximate supervised classroom feature.
-
-Record a waypoint with the dashboard or `W`. Start a new run with a fresh home position
-by default, or explicitly resume a saved map:
-
-```powershell
-python robomaster_yolo_ai.py --resume-map --mission-map .\mission_map.json
-```
-
-## Voice, captions, and object reading
-
-- Click **TALK**, press `V` or `Space` in the preview, or press global `F8` on Windows.
-- The system records five seconds, transcribes speech, and sends the recent scenario
-  conversation to OpenAI for a short spoken response.
-- The student transcript and robot response remain visible as captions.
-- Click **READ OBJECTS** or press `L` to speak current local detector labels without a
-  cloud request.
-- Dashboard controls mute/unmute TTS and adjust its rate and volume.
-- `N` toggles automatic narration. Recognition and safety stopping remain active when
-  narration is off.
-
-Search & Rescue stops as soon as a person is detected, regardless of the narration
-setting, and asks “Do you need help?” when narration is enabled. If no person is visible,
-it names detected objects or says it is still scanning. A confirmed red LEGO cross also
-stops motion and starts the help check. Conversation history is retained separately per
-mission for natural back-and-forth turns.
-
-## LEGO support
-
-### Lego-Identification checkpoint
-
-The optional integration uses
-[`vsmidhun21/Lego-Identification`](https://github.com/vsmidhun21/Lego-Identification)
-`FinalCoShSi.pt`, which labels 34 color/shape/size combinations. Install the pinned,
-hash-verified checkpoint locally with:
-
-```powershell
-.\setup_lego_identification.ps1
-```
-
-The checkpoint runs in a background worker only for relevant missions. Tune or disable it:
-
-```powershell
-python robomaster_yolo_ai.py `
-  --lego-model-confidence 0.35 `
-  --lego-model-interval 0.60 `
-  --lego-model-imgsz 512
-
-python robomaster_yolo_ai.py --disable-lego-model
-```
-
-The upstream repository had no license file at the pinned revision. Do not redistribute
-its weights without permission. PyTorch checkpoints are executable serialization; the
-setup pins commit `ddd54ae077a8fed243065a1104ee14eb4aa5f5e2` and verifies SHA256
-`87591257D011CC7409CFF14BABF28A1D15402AB521E75F3D10BF5F7A1E013CF6`.
-
-### Help signal and tagged targets
-
-The semantic help pattern is a red 5×5 LEGO cross:
-
-```text
-..R..
-..R..
-RRRRR
-..R..
-..R..
-```
-
-Generate references with:
-
-```powershell
-python generate_lego_help_pattern.py --output lego_help_red_cross.png
-python generate_lego_marker.py --id 0 --output lego_marker_0.png
-```
-
-The red cross must be camera-facing and is confirmed over three consecutive frames.
-Plain red squares and rectangles are rejected by the contour test. ArUco markers are a
-more reliable autonomous target than an untagged colored brick. LEGO vision never
-replaces ToF collision sensing.
-
-## Controls
-
-| Input | Action |
-| --- | --- |
-| Mouse | Scenario cards, target selection, all dashboard buttons |
-| `0`–`9` | Select the corresponding scenario |
-| `S` | Open scenario menu; pauses and disarms |
-| `V`, `Space`, global `F8` | Start a voice turn |
-| `L` | Read visible objects aloud |
-| `T` | Cycle through targets allowed by the current profile |
-| `W` | Record a waypoint in teacher mode |
-| `H` | Select Return to Base in teacher mode |
-| `P` | Pause/resume; pausing disarms |
-| `M` | Arm/disarm in teacher mode |
-| `E`, `Esc`, global `Esc` | Latch emergency stop |
-| `R` | Reset emergency latch; remains disarmed |
-| `N` | Toggle automatic narration |
-| `Q` | Stop and exit |
-
-Student mode cannot arm, reset, record waypoints, or initiate return-to-base. Disarming
-and emergency stopping remain available. Scenario and target changes require re-arming.
-
-## Dry-run and physical motion
-
-Exercise navigation and arming logic without hardware:
-
-```powershell
-python robomaster_yolo_ai.py --motion-backend dry-run --enable-motion
-```
-
-Dry-run reports four simulated 2 m ToF ranges and records commands without moving.
-
-Physical motion requires a compatible Python SDK/driver and four live, uniquely mapped
-ToF channels. DJI's public PC SDK documents EP/EP Core support; an S1-compatible driver
-must independently expose the same `robomaster` client API. The application does not
-automate RoboMaster PC keyboard controls.
-
-The default `.\setup.ps1` command installs the pinned SDK automatically. If setup was
-run with `-LocalOnly`, install the robot environment separately with:
-
-```powershell
-.\setup_robot_sdk.ps1
-.\.venv-robot\Scripts\Activate.ps1
-```
-
-After wheel-off-ground validation:
-
-```powershell
-python robomaster_yolo_ai.py `
-  --motion-backend robomaster `
-  --conn-type ap `
-  --tof-layout front,left,right,rear `
-  --min-tof-count 4 `
-  --enable-motion
-```
-
-Optional gimbal tracking is a separate opt-in:
-
-```powershell
-python robomaster_yolo_ai.py `
-  --motion-backend robomaster `
-  --enable-motion `
-  --enable-gimbal-tracking
-```
-
-Verify pitch/yaw direction with the chassis raised before floor operation. A gimbal SDK
-error triggers the same latched emergency-stop path as a chassis command failure.
-
-### Safety interlocks
-
-- Motion is disabled by default and starts disarmed even with `--enable-motion`.
-- Arming requires fresh, positive readings from the configured number of ToF sensors.
-- ToF direction names must be supported and unique; duplicate mappings fail startup.
-- Forward, reverse, lateral, and rotation commands each check the relevant clearance.
-- A large person in the forward visual corridor independently blocks forward motion.
-- A selected target that is visually close stops the approach even if a low LEGO object
-  is below the front ToF beam.
-- Commands are clamped to 0.12 m/s and 12°/s and use a 0.35 s SDK timeout.
-- Asynchronous impact stops plus chassis and gimbal command sends share one lock,
-  preventing a stale command from restarting an actuator after a safety callback.
-- Emergency state is latched before SDK stop calls; a failed SDK call cannot leave the
-  controller logically armed.
-- Impact logging is idempotent, the vision-loop watchdog stops on a stall, and closing
-  the preview stops operation.
-- Mission selection, target changes, pause, student mode, scenario menu, rescue person,
-  help signal, and mission completion all disarm or stop as appropriate.
-
-Mission events are appended to `mission_events.jsonl`; maps are saved to
-`mission_map.json`. Both paths are configurable.
-
-## Architecture
-
-| File | Responsibility |
-| --- | --- |
-| `robomaster_yolo_ai.py` | Runtime orchestration, screen capture, detectors, voice workers, UI actions |
-| `autonomy.py` | Hardware/dry-run backends, safety controller, low-speed planner, mission log |
-| `navigation.py` | Target tracker, navigation state machine, gimbal planner, waypoints/map |
-| `dashboard.py` | OpenCV dashboard rendering and mouse hit-testing |
-| `scenario_profiles.py` | Scenario schema, validation, and catalog |
-| `scenarios.json` | User-editable mission definitions |
-| `lego_vision.py` | OpenCV LEGO, ArUco, and red-cross recognition |
-| `lego_identification.py` | Optional asynchronous third-party model wrapper |
-
-## Tests
-
-```powershell
-python -m py_compile autonomy.py navigation.py dashboard.py scenario_profiles.py `
-  lego_vision.py robomaster_yolo_ai.py
-python -m unittest discover -s tests -v
-```
-
-The tests cover safety serialization, stop failures, impact latching, range-direction
-validation, visual close stops, rescue/narration independence, target persistence,
-scan timeout, obstacle recovery, map round trips, gimbal commands, dashboard clicks,
-compact rendering, TTS failure handling, legacy ArUco, preview closure, and local-only
-startup. They do **not** certify physical motion; hardware behavior must be validated on
-the exact robot, sensors, firmware, SDK, surface, and test area.
-
-The Windows GitHub Actions workflow runs the compile and unit-test commands on Python
-3.11 and on the Python 3.8 robot-control environment. The Python 3.8 job also installs
-`requirements-robot.txt` and verifies the native RoboMaster SDK import.
+- Begin with saved inputs and the laptop dry-run.
+- Keep physical RoboMaster motion in a separate S1 Lab program.
+- First Lab tests use raised drive wheels and direct teacher supervision.
+- Camera and microphone data need consent and a stated retention rule.
+- A model confidence is evidence, not permission to move.
+- A lost wireless message, invalid key, stale frame, exception, or unknown input
+  produces HOLD or STOP.
+- Do not use this classroom project for safety-critical operation.
