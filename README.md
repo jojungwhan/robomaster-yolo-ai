@@ -39,6 +39,48 @@ Public repository: https://github.com/jojungwhan/robomaster-yolo-ai
 
 ## Quick start
 
+On Windows, the one-time setup script installs the RoboMaster PC application and the
+project's Python dependencies:
+
+```powershell
+.\setup.ps1
+.\.venv-robot\Scripts\Activate.ps1
+python robomaster_yolo_ai.py
+```
+
+`setup.ps1` downloads `RoboMaster_x64_Installer_v1.1.5.exe` from the
+[repository-provided Google Drive file](https://drive.google.com/file/d/1KaB71nUmsWfCn3udnFZWmD_qKw3eBObs/view?usp=drive_link),
+verifies its pinned SHA256 and Windows publisher signature, and runs its documented
+Inno Setup unattended installation. Windows may display an administrator approval
+prompt. The installer is never executed if either verification fails, and the setup
+uses `/NORESTART` so it cannot restart the computer automatically.
+
+The same setup also installs a pinned 64-bit Python 3.8.10 runtime when needed,
+creates `.venv-robot`, and runs:
+
+```powershell
+python -m pip install -r requirements-robot.txt
+```
+
+DJI published the Windows RoboMaster SDK only for Python 3.6-3.8. The repository
+therefore keeps an offline, hash-pinned copy of the Python 3.8 SDK wheel and its native
+codec DLLs under `vendor/robomaster-sdk/windows`. It also archives the two prerequisite
+executables from DJI's pinned SDK commit. The DJI-bundled all-in-one VC runtime is
+unsigned, so it is retained only as a recovery artifact and is never run by setup.
+See [`vendor/robomaster-sdk/README.md`](vendor/robomaster-sdk/README.md) for sources,
+hashes, signatures, and exact behavior.
+
+To install or repair only the RoboMaster PC application, run:
+
+```powershell
+.\setup_robomaster_pc.ps1
+```
+
+To create only the local simulation/dashboard environment, with no desktop app or
+robot SDK installation, run `.\setup.ps1 -LocalOnly`. To install the robot SDK but
+skip the RoboMaster PC desktop app, run `.\setup.ps1 -SkipRoboMasterPc`. The equivalent
+manual local-only Python setup is:
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -49,6 +91,14 @@ python robomaster_yolo_ai.py
 The first YOLO run may download `yolov8n.pt`. The application starts in dry-run mode,
 opens the scenario menu, and **cannot move physical hardware**. The LEGO checkpoint is
 optional; if it is absent, OpenCV LEGO and ArUco detection remain available.
+
+### RoboMaster PC camera view
+
+Connect the S1/EP in the RoboMaster PC application and place its live camera view on
+the monitor selected by `--screen`. This project analyzes the selected monitor; it does
+not control the RoboMaster PC application's keyboard or mouse input. Keep the Python
+motion backend in its default dry-run mode when the PC application is being used only
+as the camera source.
 
 Cloud vision and conversation are also optional. Set the key only in the current shell
 or another secret manager; never put a real key in source control:
@@ -295,6 +345,14 @@ ToF channels. DJI's public PC SDK documents EP/EP Core support; an S1-compatible
 must independently expose the same `robomaster` client API. The application does not
 automate RoboMaster PC keyboard controls.
 
+The default `.\setup.ps1` command installs the pinned SDK automatically. If setup was
+run with `-LocalOnly`, install the robot environment separately with:
+
+```powershell
+.\setup_robot_sdk.ps1
+.\.venv-robot\Scripts\Activate.ps1
+```
+
 After wheel-off-ground validation:
 
 ```powershell
@@ -368,5 +426,6 @@ compact rendering, TTS failure handling, legacy ArUco, preview closure, and loca
 startup. They do **not** certify physical motion; hardware behavior must be validated on
 the exact robot, sensors, firmware, SDK, surface, and test area.
 
-The Windows GitHub Actions workflow runs the same compile and unit-test commands on
-pushes and pull requests.
+The Windows GitHub Actions workflow runs the compile and unit-test commands on Python
+3.11 and on the Python 3.8 robot-control environment. The Python 3.8 job also installs
+`requirements-robot.txt` and verifies the native RoboMaster SDK import.

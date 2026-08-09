@@ -507,6 +507,14 @@ def preview_window_is_visible(preview_window):
         return False
 
 
+def create_screen_capture():
+    """Create an MSS capture object across both the v9 and v10 public APIs."""
+    capture_type = getattr(mss, "MSS", None)
+    if capture_type is not None:
+        return capture_type()
+    return mss.mss()
+
+
 def calculate_target_guidance(detections, target_label, frame_shape):
     if not target_label:
         return "PRESS T TO SELECT A TARGET", None
@@ -899,7 +907,7 @@ def main(argv=None):
             f"{openai_error}"
         )
 
-    sct = mss.MSS()
+    sct = create_screen_capture()
     max_screen = len(sct.monitors) - 1
     if args.screen < 1 or args.screen > max_screen:
         sct.close()
