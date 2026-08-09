@@ -22,10 +22,11 @@ from autonomy import (
     AutonomousPlanner,
     DryRunBackend,
     MissionLogger,
-    MotionCommand,
     RoboMasterBackend,
     SafetyMotionController,
+    VALID_TOF_DIRECTIONS,
 )
+from dashboard import ClassroomDashboard
 from lego_identification import (
     AsyncLegoIdentificationDetector,
     LegoIdentificationDetector,
@@ -36,6 +37,8 @@ from lego_vision import (
     detect_lego,
     detect_red_cross_signal,
 )
+from navigation import GimbalTracker, MissionMap, MissionNavigator, NavigationState
+from scenario_profiles import ScenarioCatalog
 
 
 CHAT_MODEL = "gpt-4o-mini"
@@ -48,82 +51,52 @@ DEFAULT_LEGO_MODEL = (
     / "lego-identification"
     / "FinalCoShSi.pt"
 )
-
-SCENARIOS = {
-    "exploration": {
-        "name": "Exploration",
-        "system_prompt": (
-            "You are the voice of a DJI RoboMaster S1 exploration assistant. "
-            "Answer naturally, remember the conversation, and keep spoken replies "
-            "to two short sentences unless the user asks for more detail."
-        ),
-        "scene_prompt": (
-            "Give one short, useful, slightly witty observation about the scene."
-        ),
-    },
-    "rescue": {
-        "name": "Search & Rescue (SDG + Alpha)",
-        "system_prompt": (
-            "You are a cautious search-and-rescue training assistant for disaster "
-            "response, supporting SDG 3 and SDG 11 goals. Prioritize possible people, "
-            "hazards, exits, and useful supplies. Treat computer-vision labels as "
-            "unverified and never claim that someone is safe or that emergency help "
-            "has been contacted. Keep spoken replies short and actionable."
-        ),
-        "scene_prompt": (
-            "Give one concise search-and-rescue status report. Mention possible people, "
-            "hazards, or useful supplies, and clearly express uncertainty."
-        ),
-    },
-    "target": {
-        "name": "Target Guidance",
-        "system_prompt": (
-            "You are a visual target-guidance assistant for a DJI RoboMaster S1. "
-            "Motion may be enabled through a range-sensor safety controller. Never "
-            "claim movement succeeded unless the motion status confirms it."
-        ),
-        "scene_prompt": (
-            "Briefly report the selected target and any useful visual context. "
-            "Do not claim that the robot moved."
-        ),
-    },
-    "lego": {
-        "name": "LEGO Search",
-        "system_prompt": (
-            "You are a LEGO search assistant. Identify colored LEGO candidates, "
-            "Lego-Identification piece classes, semantic LEGO patterns, and "
-            "ArUco-tagged builds. Explain uncertainty and keep replies concise."
-        ),
-        "scene_prompt": (
-            "Briefly name the LEGO pieces, semantic patterns, or marker IDs and report "
-            "the selected target. A red LEGO cross means help is requested."
-        ),
-    },
-}
-
-SCENARIO_KEYS = {
-    ord("1"): "exploration",
-    ord("2"): "rescue",
-    ord("3"): "target",
-    ord("4"): "lego",
-}
+DEFAULT_SCENARIOS_PATH = Path(__file__).resolve().parent / "scenarios.json"
+DEFAULT_MISSION_MAP_PATH = Path(__file__).resolve().parent / "mission_map.json"
+scenario_catalog = ScenarioCatalog.load(DEFAULT_SCENARIOS_PATH)
+SCENARIOS = scenario_catalog.as_legacy_dict()
+SCENARIO_KEYS = scenario_catalog.key_map
 
 shutdown_event = threading.Event()
 voice_busy = threading.Event()
 tts_speaking = threading.Event()
-speech_queue = queue.Queue()
+tts_available = threading.Event()
+tts_failed = threading.Event()
+cloud_available = threading.Event()
+speech_queue = queue.Queue(maxsize=32)
 voice_requests = queue.Queue(maxsize=1)
 scene_requests = queue.Queue(maxsize=1)
 state_lock = threading.Lock()
 
 runtime_state = {
-    "scenario_id": "exploration",
+    "scenario_id": scenario_catalog.default.id,
     "target_label": "person",
     "auto_narration": True,
     "voice_status": "Press V, Space, or F8 to talk",
+    "student_caption": "",
+    "robot_caption": "",
+    "cloud_status": "checking",
+    "tts_status": "starting",
+    "tts_muted": False,
+    "tts_rate": 150,
+    "tts_volume": 1.0,
+    "mission_paused": False,
+    "ui_role": "teacher",
+    "navigation_state": NavigationState.DISARMED.value,
+    "navigation_reason": "motion disarmed",
+    "gimbal_status": "disabled",
+    "yolo_inference_ms": 0.0,
 }
 
 conversation_histories = {scenario_id: [] for scenario_id in SCENARIOS}
+
+
+def get_scenario_profile(scenario_id):
+    return scenario_catalog.get(scenario_id)
+
+
+def scenario_tracks_visual_target(scenario_id):
+    return get_scenario_profile(scenario_id).navigation_policy in ("target", "lego")
 
 
 def set_voice_status(status):
@@ -172,6 +145,10 @@ def global_emergency_stop_pressed():
 
 
 def request_voice_turn(state, labels):
+    if not cloud_available.is_set():
+        set_voice_status("Voice conversation unavailable - OpenAI key not configured")
+        speak("Cloud conversation is unavailable. Local vision is still running.")
+        return False
     if voice_busy.is_set():
         set_voice_status("Already processing a voice turn")
         return False
@@ -209,7 +186,34 @@ def speak(text):
     text = (text or "").strip()
     if text:
         print(f"[Robot Voice]: {text}")
-        speech_queue.put(text)
+        with state_lock:
+            runtime_state["robot_caption"] = text
+            runtime_state["robot_caption_at"] = time.time()
+            muted = runtime_state["tts_muted"]
+        if muted:
+            return False
+        if tts_failed.is_set():
+            return False
+        try:
+            speech_queue.put_nowait(text)
+            return True
+        except queue.Full:
+            with state_lock:
+                runtime_state["tts_status"] = "busy - speech queue full"
+            return False
+    return False
+
+
+def disable_tts(error):
+    tts_available.clear()
+    tts_failed.set()
+    with state_lock:
+        runtime_state["tts_status"] = f"unavailable: {error}"
+    while True:
+        try:
+            speech_queue.get_nowait()
+        except queue.Empty:
+            break
 
 
 def speech_worker():
@@ -217,8 +221,12 @@ def speech_worker():
         engine = pyttsx3.init()
         engine.setProperty("rate", 150)
         engine.setProperty("volume", 1.0)
+        tts_available.set()
+        with state_lock:
+            runtime_state["tts_status"] = "ready"
         print("[TTS]: Speech engine ready.")
     except Exception as error:
+        disable_tts(error)
         print(f"Text-to-speech initialization error: {error}")
         return
 
@@ -233,14 +241,24 @@ def speech_worker():
 
         try:
             tts_speaking.set()
+            current_state = get_runtime_state()
+            if current_state["tts_muted"]:
+                continue
+            engine.setProperty("rate", current_state["tts_rate"])
+            engine.setProperty("volume", current_state["tts_volume"])
             engine.say(text)
             engine.runAndWait()
         except Exception as error:
             print(f"Text-to-speech error: {error}")
+            disable_tts(error)
+            break
         finally:
             tts_speaking.clear()
 
-    engine.stop()
+    try:
+        engine.stop()
+    except Exception:
+        pass
 
 
 def record_microphone_to_wav(duration_seconds):
@@ -294,10 +312,48 @@ def build_conversation_system_prompt(scenario_id, labels, target_label):
     label_text = ", ".join(labels) if labels else "none"
     prompt += f" Current unverified computer-vision labels: {label_text}."
 
-    if scenario_id in ("target", "lego"):
+    if scenario_tracks_visual_target(scenario_id):
         prompt += f" The selected visual target is {target_label or 'not selected'}."
 
     return prompt
+
+
+def generate_conversation_reply(openai_client, request, user_text):
+    """Run one chat turn and persist bounded history for the selected mission."""
+    scenario_id = request["scenario_id"]
+    system_prompt = build_conversation_system_prompt(
+        scenario_id,
+        request["labels"],
+        request["target_label"],
+    )
+    with state_lock:
+        recent_history = list(
+            conversation_histories[scenario_id][-MAX_HISTORY_MESSAGES:]
+        )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *recent_history,
+        {"role": "user", "content": user_text},
+    ]
+    response = openai_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        max_tokens=160,
+    )
+    reply = (response.choices[0].message.content or "").strip()
+
+    with state_lock:
+        conversation_histories[scenario_id].extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": reply},
+            ]
+        )
+        conversation_histories[scenario_id] = conversation_histories[scenario_id][
+            -MAX_HISTORY_MESSAGES:
+        ]
+    return reply
 
 
 def voice_conversation_worker(openai_client):
@@ -314,8 +370,11 @@ def voice_conversation_worker(openai_client):
         try:
             speech_wait_deadline = time.monotonic() + 15
             while (
-                tts_speaking.is_set() or not speech_queue.empty()
-            ) and not shutdown_event.is_set() and time.monotonic() < speech_wait_deadline:
+                not tts_failed.is_set()
+                and (tts_speaking.is_set() or not speech_queue.empty())
+                and not shutdown_event.is_set()
+                and time.monotonic() < speech_wait_deadline
+            ):
                 time.sleep(0.05)
 
             if tts_speaking.is_set() or not speech_queue.empty():
@@ -336,43 +395,11 @@ def voice_conversation_worker(openai_client):
                 continue
 
             print(f"[You]: {user_text}")
+            with state_lock:
+                runtime_state["student_caption"] = user_text
+                runtime_state["student_caption_at"] = time.time()
             set_voice_status("Thinking...")
-
-            scenario_id = request["scenario_id"]
-            system_prompt = build_conversation_system_prompt(
-                scenario_id,
-                request["labels"],
-                request["target_label"],
-            )
-
-            with state_lock:
-                recent_history = list(
-                    conversation_histories[scenario_id][-MAX_HISTORY_MESSAGES:]
-                )
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                *recent_history,
-                {"role": "user", "content": user_text},
-            ]
-
-            response = openai_client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
-                max_tokens=160,
-            )
-            reply = (response.choices[0].message.content or "").strip()
-
-            with state_lock:
-                conversation_histories[scenario_id].extend(
-                    [
-                        {"role": "user", "content": user_text},
-                        {"role": "assistant", "content": reply},
-                    ]
-                )
-                conversation_histories[scenario_id] = conversation_histories[
-                    scenario_id
-                ][-MAX_HISTORY_MESSAGES:]
+            reply = generate_conversation_reply(openai_client, request, user_text)
 
             set_voice_status("Press V for another turn")
             speak(reply)
@@ -414,7 +441,7 @@ def scene_description_worker(openai_client):
             mission_prompt = SCENARIOS[scenario_id]["scene_prompt"]
             target_context = (
                 f" Selected target: {target_label}."
-                if scenario_id in ("target", "lego")
+                if scenario_tracks_visual_target(scenario_id)
                 else ""
             )
 
@@ -471,6 +498,13 @@ def exclude_preview_from_capture(preview_window):
             preview_handle, wda_exclude_from_capture
         ):
             user32.SetWindowDisplayAffinity(preview_handle, wda_monitor_only)
+
+
+def preview_window_is_visible(preview_window):
+    try:
+        return cv2.getWindowProperty(preview_window, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        return False
 
 
 def calculate_target_guidance(detections, target_label, frame_shape):
@@ -548,93 +582,6 @@ def draw_detection(frame, detection, selected, annotation):
     )
 
 
-def draw_status_panel(
-    frame,
-    state,
-    detections,
-    guidance,
-    annotation_scale,
-    motion_status,
-    lego_model_status,
-):
-    labels = sorted({item["label"] for item in detections})
-    label_summary = ", ".join(labels) if labels else "none"
-    if len(label_summary) > 65:
-        label_summary = label_summary[:62] + "..."
-
-    lines = [
-        (
-            f"Mission: {SCENARIOS[state['scenario_id']]['name']} | "
-            f"Narration: {'ON' if state['auto_narration'] else 'OFF'}",
-            (255, 255, 255),
-        ),
-        (f"CV: {len(detections)} | {label_summary}", (0, 255, 0)),
-    ]
-
-    ranges = motion_status["ranges"]
-    range_text = " ".join(
-        f"{name[0].upper()}:{distance:.0f}"
-        for name, distance in ranges.items()
-    ) or "no ToF"
-    position = motion_status["position"]
-    motion_color = {
-        "ARMED": (0, 255, 0),
-        "ESTOP": (0, 0, 255),
-    }.get(motion_status["mode"], (0, 165, 255))
-    lines.append(
-        (
-            f"Motion: {motion_status['mode']} ({motion_status['backend']}) | "
-            f"{motion_status['reason']} | ToF mm {range_text} | "
-            f"pos {position[0]:.2f},{position[1]:.2f},{position[2]:.0f}",
-            motion_color,
-        )
-    )
-
-    if state["scenario_id"] in ("target", "lego"):
-        lines.append(
-            (
-                f"Target: {state['target_label']} | {guidance}",
-                (0, 165, 255),
-            )
-        )
-
-    if state["scenario_id"] in ("rescue", "lego"):
-        lines.append((f"Lego-Identification: {lego_model_status}", (180, 220, 255)))
-
-    lines.extend(
-        [
-            (f"Voice: {state['voice_status']}", (255, 255, 0)),
-            (
-                "Keys: 1 Explore | 2 Rescue | 3 Target | 4 LEGO | "
-                "V/Space/F8 Talk | T Next target",
-                (220, 220, 220),
-            ),
-            (
-                "Motion: M Arm/Disarm | E/Esc EMERGENCY STOP | R Reset | "
-                "N Narration | Q Quit",
-                (220, 220, 220),
-            ),
-        ]
-    )
-
-    row_height = 17
-    panel_height = round((8 + row_height * len(lines)) * annotation_scale)
-    cv2.rectangle(frame, (0, 0), (frame.shape[1], panel_height), (0, 0, 0), -1)
-
-    for index, (text, color) in enumerate(lines):
-        y = round((16 + row_height * index) * annotation_scale)
-        cv2.putText(
-            frame,
-            text,
-            (round(8 * annotation_scale), y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38 * annotation_scale,
-            color,
-            max(1, round(0.8 * annotation_scale)),
-            cv2.LINE_AA,
-        )
-
-
 def cycle_target(current_target, labels):
     labels = sorted(set(labels))
     if not labels:
@@ -648,7 +595,65 @@ def cycle_target(current_target, labels):
 
 
 def is_lego_target_label(label):
-    return label.startswith("lego_") and not label.startswith("lego_signal_")
+    return (
+        isinstance(label, str)
+        and label.startswith("lego_")
+        and not label.startswith("lego_signal_")
+    )
+
+
+def choose_initial_lego_target(current_target, labels):
+    """Choose once on mode entry; never replace a valid target after a missed frame."""
+    if is_lego_target_label(current_target):
+        return current_target
+    lego_labels = sorted(label for label in labels if is_lego_target_label(label))
+    marker_labels = [label for label in lego_labels if label.startswith("lego_marker_")]
+    if marker_labels:
+        return marker_labels[0]
+    return lego_labels[0] if lego_labels else current_target
+
+
+def profile_accepts_target(profile, label):
+    if not profile.accepts_target(label):
+        return False
+    if profile.navigation_policy == "lego":
+        return is_lego_target_label(label)
+    return True
+
+
+def validate_tof_layout(layout_text, min_tof_count):
+    layout = tuple(
+        item.strip().lower() for item in layout_text.split(",") if item.strip()
+    )
+    if "front" not in layout:
+        raise ValueError("--tof-layout must include a front sensor.")
+    if len(set(layout)) != len(layout):
+        raise ValueError("--tof-layout directions must be unique.")
+    unsupported = set(layout) - VALID_TOF_DIRECTIONS
+    if unsupported:
+        raise ValueError(
+            "--tof-layout contains unsupported directions: "
+            + ", ".join(sorted(unsupported))
+        )
+    if min_tof_count < 1 or min_tof_count > len(layout):
+        raise ValueError("--min-tof-count must fit the configured --tof-layout.")
+    return layout
+
+
+def create_openai_client(client_factory=OpenAI):
+    try:
+        return client_factory(), None
+    except Exception as error:
+        return None, error
+
+
+def enforce_rescue_person_stop(profile, labels, motion_controller):
+    person_seen = profile.navigation_policy == "rescue" and "person" in labels
+    if person_seen and motion_controller.armed:
+        motion_controller.disarm(
+            "person detected in rescue mode; re-arm after assessment"
+        )
+    return person_seen
 
 
 def parse_args(argv=None):
@@ -665,6 +670,11 @@ def parse_args(argv=None):
         "--enable-motion",
         action="store_true",
         help="Permit arming with M after all ToF safety checks pass.",
+    )
+    parser.add_argument(
+        "--enable-gimbal-tracking",
+        action="store_true",
+        help="Track the locked target with the gimbal only while motion is armed.",
     )
     parser.add_argument(
         "--conn-type",
@@ -696,6 +706,50 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mission-log",
         default="mission_events.jsonl",
+    )
+    parser.add_argument(
+        "--scenarios",
+        default=str(DEFAULT_SCENARIOS_PATH),
+        help="Path to the version-1 scenario profile JSON file.",
+    )
+    parser.add_argument(
+        "--mission-map",
+        default=str(DEFAULT_MISSION_MAP_PATH),
+        help="Path used to load and save odometry, obstacles, and waypoints.",
+    )
+    parser.add_argument(
+        "--resume-map",
+        action="store_true",
+        help="Resume a saved map; otherwise the current position becomes a new home.",
+    )
+    parser.add_argument("--dashboard-width", type=int, default=1280)
+    parser.add_argument("--dashboard-height", type=int, default=840)
+    parser.add_argument(
+        "--yolo-model",
+        default="yolov8n.pt",
+        help="Ultralytics detection checkpoint; use a custom model for domain classes.",
+    )
+    parser.add_argument(
+        "--yolo-confidence",
+        type=float,
+        default=0.20,
+        help="Minimum primary object-detection confidence.",
+    )
+    parser.add_argument(
+        "--yolo-imgsz",
+        type=int,
+        default=640,
+        help="Primary YOLO inference size; smaller values are faster but less detailed.",
+    )
+    parser.add_argument(
+        "--yolo-interval",
+        type=float,
+        default=0.10,
+        help="Minimum seconds after an inference before running YOLO again.",
+    )
+    parser.add_argument(
+        "--yolo-device",
+        help="Optional Ultralytics device such as 0, cpu, or mps.",
     )
     parser.add_argument(
         "--lego-model",
@@ -730,14 +784,36 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    global scenario_catalog, SCENARIOS, SCENARIO_KEYS, conversation_histories
     args = parse_args(argv)
-    tof_layout = tuple(
-        item.strip().lower() for item in args.tof_layout.split(",") if item.strip()
-    )
-    if "front" not in tof_layout:
-        raise SystemExit("--tof-layout must include a front sensor.")
-    if args.min_tof_count < 1 or args.min_tof_count > len(tof_layout):
-        raise SystemExit("--min-tof-count must fit the configured --tof-layout.")
+    try:
+        scenario_catalog = ScenarioCatalog.load(args.scenarios)
+    except Exception as error:
+        raise SystemExit(f"Could not load scenario profiles: {error}") from error
+    SCENARIOS = scenario_catalog.as_legacy_dict()
+    SCENARIO_KEYS = scenario_catalog.key_map
+    conversation_histories = {
+        profile.id: list(conversation_histories.get(profile.id, ()))
+        for profile in scenario_catalog
+    }
+    with state_lock:
+        runtime_state["scenario_id"] = scenario_catalog.default.id
+        preferred = scenario_catalog.default.preferred_target
+        if preferred:
+            runtime_state["target_label"] = preferred
+    if args.dashboard_width < 960 or args.dashboard_height < 640:
+        raise SystemExit("Dashboard size must be at least 960x640.")
+    if not 0 <= args.yolo_confidence <= 1:
+        raise SystemExit("--yolo-confidence must be between 0 and 1.")
+    if args.yolo_imgsz < 160:
+        raise SystemExit("--yolo-imgsz must be at least 160.")
+    if args.yolo_interval < 0:
+        raise SystemExit("--yolo-interval cannot be negative.")
+
+    try:
+        tof_layout = validate_tof_layout(args.tof_layout, args.min_tof_count)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     if args.motion_backend == "robomaster":
         motion_backend = RoboMasterBackend(conn_type=args.conn_type)
@@ -761,7 +837,27 @@ def main(argv=None):
     atexit.register(motion_controller.close)
 
     planner = AutonomousPlanner()
-    yolo_model = YOLO("yolov8n.pt")
+    if args.resume_map:
+        try:
+            mission_map = MissionMap.load(args.mission_map)
+        except Exception as error:
+            print(f"[Map]: Could not load {args.mission_map}; starting a new map: {error}")
+            mission_map = MissionMap()
+    else:
+        mission_map = MissionMap()
+    navigator = MissionNavigator(planner=planner, mission_map=mission_map)
+    gimbal_tracker = GimbalTracker()
+    try:
+        yolo_model = YOLO(args.yolo_model)
+    except Exception as error:
+        motion_controller.close()
+        try:
+            atexit.unregister(motion_controller.close)
+        except Exception:
+            pass
+        raise SystemExit(
+            f"Primary YOLO model could not be loaded ({args.yolo_model}): {error}"
+        ) from error
     lego_detector = None
     if args.disable_lego_model:
         lego_model_status = "OFF (--disable-lego-model)"
@@ -788,23 +884,55 @@ def main(argv=None):
         except Exception as error:
             lego_model_status = f"OFF ({type(error).__name__})"
             print(f"[LEGO Model]: Disabled safely: {error}")
-    openai_client = OpenAI()
+    openai_client, openai_error = create_openai_client()
+    if openai_client is not None:
+        cloud_available.set()
+        with state_lock:
+            runtime_state["cloud_status"] = "ready"
+    else:
+        cloud_available.clear()
+        with state_lock:
+            runtime_state["cloud_status"] = "unavailable"
+            runtime_state["voice_status"] = "Local vision only - OpenAI key not configured"
+        print(
+            "[OpenAI]: Cloud features disabled; local vision remains active: "
+            f"{openai_error}"
+        )
 
     sct = mss.MSS()
-    if args.screen < 1 or args.screen >= len(sct.monitors):
+    max_screen = len(sct.monitors) - 1
+    if args.screen < 1 or args.screen > max_screen:
+        sct.close()
         motion_controller.close()
-        raise SystemExit(f"--screen must be between 1 and {len(sct.monitors) - 1}.")
+        try:
+            atexit.unregister(motion_controller.close)
+        except Exception:
+            pass
+        raise SystemExit(f"--screen must be between 1 and {max_screen}.")
     monitor = dict(sct.monitors[args.screen])
 
     preview_window = "RoboMaster S1 - YOLO CV Pipeline"
-    preview_width = 640
-    preview_height = round(preview_width * monitor["height"] / monitor["width"])
-    preview_x = monitor["left"] + monitor["width"] - preview_width - 30
-    preview_y = monitor["top"] + 30
+    preview_width = min(args.dashboard_width, monitor["width"])
+    preview_height = min(args.dashboard_height, monitor["height"] - 40)
+    if preview_width < 960 or preview_height < 600:
+        motion_controller.close()
+        sct.close()
+        try:
+            atexit.unregister(motion_controller.close)
+        except Exception:
+            pass
+        raise SystemExit(
+            "Selected screen is too small for the mission dashboard; "
+            "choose a screen with at least 960x640 usable pixels."
+        )
+    dashboard = ClassroomDashboard(preview_width, preview_height)
+    preview_x = monitor["left"] + max(0, monitor["width"] - preview_width - 20)
+    preview_y = monitor["top"] + 20
 
     cv2.namedWindow(preview_window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(preview_window, preview_width, preview_height)
     cv2.moveWindow(preview_window, preview_x, preview_y)
+    cv2.setMouseCallback(preview_window, dashboard.mouse_callback)
 
     try:
         cv2.setWindowProperty(preview_window, cv2.WND_PROP_TOPMOST, 1)
@@ -814,8 +942,8 @@ def main(argv=None):
     exclude_preview_from_capture(preview_window)
 
     annotation_scale = max(
-        monitor["width"] / preview_width,
-        monitor["height"] / preview_height,
+        monitor["width"] / max(args.dashboard_width - dashboard.sidebar_width, 1),
+        monitor["height"] / max(args.dashboard_height - dashboard.caption_height, 1),
     )
     annotation = {
         "box_thickness": max(2, round(2 * annotation_scale)),
@@ -824,58 +952,83 @@ def main(argv=None):
         "label_padding": max(2, round(4 * annotation_scale)),
     }
 
-    workers = [
-        threading.Thread(target=speech_worker, name="speech", daemon=True),
-        threading.Thread(
-            target=voice_conversation_worker,
-            args=(openai_client,),
-            name="voice-conversation",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=scene_description_worker,
-            args=(openai_client,),
-            name="scene-description",
-            daemon=True,
-        ),
-    ]
+    workers = [threading.Thread(target=speech_worker, name="speech", daemon=True)]
+    if openai_client is not None:
+        workers.extend(
+            [
+                threading.Thread(
+                    target=voice_conversation_worker,
+                    args=(openai_client,),
+                    name="voice-conversation",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=scene_description_worker,
+                    args=(openai_client,),
+                    name="scene-description",
+                    daemon=True,
+                ),
+            ]
+        )
     for worker in workers:
         worker.start()
 
-    print("YOLO + OpenAI Mission System Active.")
+    try:
+        sd.query_devices(kind="input")
+        microphone_ready = True
+    except Exception as error:
+        microphone_ready = False
+        print(f"[Microphone]: No usable input device detected: {error}")
+
     print(
-        "Keys: 1 Explore | 2 Rescue | 3 Target | 4 LEGO | "
-        "V/Space/F8 Talk | T Next target | M Arm | E/Esc Stop | R Reset | Q Quit"
+        "YOLO Mission System Active. "
+        + ("OpenAI cloud enabled." if openai_client else "Local-only mode.")
+    )
+    print(
+        "Keys: 0-9 Scenario | S Scenario menu | V/Space/F8 Talk | L Read objects | "
+        "T Next target | W Waypoint | H Home | P Pause | M Arm | E/Esc Stop | Q Quit"
     )
     print(
         f"[Motion]: backend={args.motion_backend}, requested={args.enable_motion}, "
         f"ToF layout={','.join(tof_layout)}. Motion starts DISARMED."
     )
     speak(
-        "Mission system online. Press one, two, three, or four to select a scenario. "
-        "Press V, Space, or F8 to talk."
+        "Mission system online. Select a scenario card to begin. "
+        "Motion remains disarmed until a teacher completes preflight and presses arm."
     )
 
     last_ai_check = time.time()
     ai_interval = 12
-    detection_confidence = 0.20
-    inference_size = 640
+    yolo_detections = []
+    yolo_inference_sequence = 0
+    last_yolo_inference_at = float("-inf")
     last_guidance = None
     last_guidance_spoken = 0
     last_rescue_signature = None
     last_rescue_announcement = 0
-    previous_scenario = "exploration"
+    previous_scenario = scenario_catalog.default.id
     last_position_log = 0
     help_signal_gate = ConsecutiveDetectionGate(required_frames=3, release_frames=8)
     pending_help_check = False
+    previous_rescue_person_seen = False
+    previous_navigation_state = None
+    last_map_save = 0
+    preview_rendered = False
+    gimbal_active = False
+    dashboard.add_event("Mission console started")
 
     try:
         while True:
+            if preview_rendered and not preview_window_is_visible(preview_window):
+                motion_controller.emergency_stop("preview window closed")
+                print("[Safety]: Preview window closed; motion stopped.")
+                break
             screenshot = sct.grab(monitor)
             frame = np.array(screenshot)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
             state = get_runtime_state()
+            profile = get_scenario_profile(state["scenario_id"])
             if state["scenario_id"] != previous_scenario:
                 previous_scenario = state["scenario_id"]
                 last_rescue_signature = None
@@ -883,28 +1036,44 @@ def main(argv=None):
                 help_signal_gate.reset()
                 pending_help_check = False
 
-            results = yolo_model(
-                frame,
-                stream=True,
-                verbose=False,
-                conf=detection_confidence,
-                imgsz=inference_size,
-            )
-            detections = []
+            capture_time = time.monotonic()
+            if capture_time - last_yolo_inference_at >= args.yolo_interval:
+                inference_started_at = time.monotonic()
+                yolo_options = {
+                    "stream": True,
+                    "verbose": False,
+                    "conf": args.yolo_confidence,
+                    "imgsz": args.yolo_imgsz,
+                }
+                if args.yolo_device:
+                    yolo_options["device"] = args.yolo_device
+                results = yolo_model(frame, **yolo_options)
+                fresh_detections = []
+                yolo_inference_sequence += 1
+                observation_id = f"yolo:{yolo_inference_sequence}"
+                for result in results:
+                    names = getattr(result, "names", yolo_model.names)
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        class_id = int(box.cls[0])
+                        fresh_detections.append(
+                            {
+                                "box": (x1, y1, x2, y2),
+                                "label": names[class_id],
+                                "confidence": float(box.conf[0]),
+                                "source": "yolo",
+                                "observation_id": observation_id,
+                            }
+                        )
+                yolo_detections = fresh_detections
+                last_yolo_inference_at = time.monotonic()
+                with state_lock:
+                    runtime_state["yolo_inference_ms"] = (
+                        last_yolo_inference_at - inference_started_at
+                    ) * 1000
+            detections = [dict(item) for item in yolo_detections]
 
-            for result in results:
-                for box in result.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    class_id = int(box.cls[0])
-                    detection = {
-                        "box": (x1, y1, x2, y2),
-                        "label": yolo_model.names[class_id],
-                        "confidence": float(box.conf[0]),
-                        "source": "yolo",
-                    }
-                    detections.append(detection)
-
-            if state["scenario_id"] in ("rescue", "lego"):
+            if profile.use_lego_vision:
                 if lego_detector is not None:
                     try:
                         detections.extend(lego_detector.detect(frame))
@@ -914,12 +1083,12 @@ def main(argv=None):
                         lego_detector.close()
                         lego_detector = None
 
-                if state["scenario_id"] == "lego":
-                    detections.extend(detect_lego(frame))
-                else:
+                if profile.navigation_policy == "rescue":
                     detections.extend(detect_red_cross_signal(frame))
+                else:
+                    detections.extend(detect_lego(frame))
 
-            if state["scenario_id"] == "lego":
+            if profile.navigation_policy == "lego":
 
                 lego_labels = sorted(
                     {
@@ -928,63 +1097,35 @@ def main(argv=None):
                         if is_lego_target_label(item["label"])
                     }
                 )
-                if lego_labels and state["target_label"] not in lego_labels:
-                    marker_labels = [
-                        label for label in lego_labels if label.startswith("lego_marker_")
-                    ]
-                    selected_lego = marker_labels[0] if marker_labels else lego_labels[0]
+                if lego_labels and not is_lego_target_label(state["target_label"]):
+                    selected_lego = choose_initial_lego_target(
+                        state["target_label"],
+                        lego_labels,
+                    )
                     with state_lock:
                         runtime_state["target_label"] = selected_lego
                     state["target_label"] = selected_lego
 
-            for detection in detections:
-                selected = (
-                    state["scenario_id"] in ("target", "lego")
-                    and detection["label"] == state["target_label"]
-                )
-                draw_detection(frame, detection, selected, annotation)
-
-            guidance = ""
-            selected_detection = None
             current_time = time.time()
 
-            if state["scenario_id"] in ("target", "lego"):
-                guidance, selected_detection = calculate_target_guidance(
-                    detections,
-                    state["target_label"],
-                    frame.shape,
-                )
-
-                if selected_detection is not None:
-                    x1, y1, x2, y2 = selected_detection["box"]
-                    target_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                    frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
-                    cv2.line(
-                        frame,
-                        frame_center,
-                        target_center,
-                        (0, 165, 255),
-                        annotation["box_thickness"],
-                        cv2.LINE_AA,
-                    )
-
-                if (
-                    guidance != last_guidance
-                    and current_time - last_guidance_spoken > 2.5
-                    and not voice_busy.is_set()
-                    and not any(
-                        item["label"] == HELP_SIGNAL_LABEL for item in detections
-                    )
-                ):
-                    speak(f"Target guidance: {guidance.lower()}.")
-                    last_guidance = guidance
-                    last_guidance_spoken = current_time
-            else:
-                last_guidance = None
-
             labels = sorted({item["label"] for item in detections})
+            rescue_person_seen = enforce_rescue_person_stop(
+                profile,
+                labels,
+                motion_controller,
+            )
+            if rescue_person_seen:
+                if not previous_rescue_person_seen:
+                    person_motion_status = motion_controller.status()
+                    motion_controller.logger.record(
+                        "person_detected",
+                        position=list(person_motion_status["position"]),
+                        labels=labels,
+                    )
+            previous_rescue_person_seen = rescue_person_seen
+
             help_signal_seen = HELP_SIGNAL_LABEL in labels
-            if state["scenario_id"] in ("rescue", "lego"):
+            if profile.navigation_policy in ("rescue", "lego"):
                 help_signal_confirmed, new_help_signal = help_signal_gate.update(
                     help_signal_seen
                 )
@@ -1025,7 +1166,7 @@ def main(argv=None):
                 last_rescue_announcement = current_time
 
             if (
-                state["scenario_id"] == "rescue"
+                profile.navigation_policy == "rescue"
                 and state["auto_narration"]
                 and not voice_busy.is_set()
                 and not help_signal_confirmed
@@ -1053,23 +1194,14 @@ def main(argv=None):
 
                     speak(rescue_message)
                     if "person" in labels:
-                        if motion_controller.armed:
-                            motion_controller.disarm(
-                                "person interaction; re-arm after conversation"
-                            )
-                        motion_status = motion_controller.status()
-                        motion_controller.logger.record(
-                            "person_detected",
-                            position=list(motion_status["position"]),
-                            labels=labels,
-                        )
                         request_voice_turn(state, labels)
                     last_rescue_signature = rescue_signature
                     last_rescue_announcement = current_time
 
             if (
                 state["auto_narration"]
-                and state["scenario_id"] != "rescue"
+                and profile.navigation_policy != "rescue"
+                and openai_client is not None
                 and labels
                 and not voice_busy.is_set()
                 and current_time - last_ai_check > ai_interval
@@ -1093,20 +1225,124 @@ def main(argv=None):
                     pass
 
             motion_status = motion_controller.status()
-            if help_signal_seen or help_signal_confirmed:
-                planned_motion = MotionCommand(reason="semantic help signal stop")
-            elif voice_busy.is_set():
-                planned_motion = MotionCommand(reason="voice interaction pause")
-            else:
-                planned_motion = planner.plan(
-                    state["scenario_id"],
-                    detections,
-                    state["target_label"],
-                    frame.shape,
-                    motion_status["ranges"],
+            navigation = navigator.plan(
+                profile,
+                detections,
+                state["target_label"],
+                frame.shape,
+                motion_status,
+                paused=state["mission_paused"] or dashboard.show_scenario_menu,
+                interaction_active=(
+                    help_signal_seen
+                    or help_signal_confirmed
+                    or rescue_person_seen
+                    or voice_busy.is_set()
+                ),
+            )
+            planned_motion = navigation.command
+            if navigation.state == NavigationState.COMPLETE:
+                motion_controller.disarm(
+                    "mission complete; inspect result before re-arming"
                 )
             motion_controller.apply(planned_motion, detections, frame.shape)
             motion_status = motion_controller.status()
+            gimbal_command = gimbal_tracker.plan(
+                navigation.selected_detection,
+                frame.shape,
+            )
+            should_track_gimbal = (
+                args.enable_gimbal_tracking
+                and motion_controller.armed
+                and navigation.selected_detection is not None
+            )
+            if should_track_gimbal:
+                if motion_controller.apply_gimbal(
+                    gimbal_command.pitch_dps,
+                    gimbal_command.yaw_dps,
+                ):
+                    gimbal_active = bool(
+                        gimbal_command.pitch_dps or gimbal_command.yaw_dps
+                    )
+                    gimbal_status = gimbal_command.reason
+                else:
+                    motion_status = motion_controller.status()
+                    gimbal_active = False
+                    gimbal_status = "failed"
+                    dashboard.add_event("Gimbal tracking failed", "danger")
+            else:
+                if gimbal_active:
+                    if not motion_controller.stop_gimbal():
+                        motion_status = motion_controller.status()
+                gimbal_active = False
+                gimbal_status = (
+                    "ready" if args.enable_gimbal_tracking else "disabled"
+                )
+            with state_lock:
+                runtime_state["navigation_state"] = navigation.state.value
+                runtime_state["navigation_reason"] = navigation.reason
+                runtime_state["gimbal_status"] = gimbal_status
+            if navigation.state != previous_navigation_state:
+                dashboard.add_event(
+                    f"Navigation: {navigation.state.value} - {navigation.reason}"
+                )
+                motion_controller.logger.record(
+                    "navigation_state_changed",
+                    scenario=profile.id,
+                    state=navigation.state.value,
+                    reason=navigation.reason,
+                    target=state["target_label"],
+                )
+                if navigation.state == NavigationState.COMPLETE:
+                    speak("Mission destination reached. Motion is disarmed.")
+                previous_navigation_state = navigation.state
+
+            selected_detection = navigation.selected_detection
+            selected_box = (
+                tuple(selected_detection["box"])
+                if selected_detection is not None
+                else None
+            )
+            for detection in detections:
+                selected = (
+                    profile.navigation_policy in ("target", "lego", "rescue")
+                    and selected_box is not None
+                    and detection["label"] == state["target_label"]
+                    and tuple(detection["box"]) == selected_box
+                )
+                draw_detection(frame, detection, selected, annotation)
+
+            if scenario_tracks_visual_target(state["scenario_id"]):
+                guidance, _ = calculate_target_guidance(
+                    [selected_detection] if selected_detection is not None else [],
+                    state["target_label"],
+                    frame.shape,
+                )
+                if selected_detection is not None:
+                    x1, y1, x2, y2 = selected_detection["box"]
+                    target_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+                    cv2.line(
+                        frame,
+                        frame_center,
+                        target_center,
+                        (0, 165, 255),
+                        annotation["box_thickness"],
+                        cv2.LINE_AA,
+                    )
+                if (
+                    guidance != last_guidance
+                    and current_time - last_guidance_spoken > 2.5
+                    and not voice_busy.is_set()
+                    and not state["mission_paused"]
+                    and not dashboard.show_scenario_menu
+                    and motion_controller.armed
+                    and not help_signal_seen
+                ):
+                    speak(f"Target guidance: {guidance.lower()}.")
+                    last_guidance = guidance
+                    last_guidance_spoken = current_time
+            else:
+                last_guidance = None
 
             if args.enable_motion and current_time - last_position_log >= 1:
                 motion_controller.logger.record(
@@ -1116,112 +1352,358 @@ def main(argv=None):
                     motion_reason=motion_status["reason"],
                 )
                 last_position_log = current_time
+            if current_time - last_map_save >= 5:
+                try:
+                    mission_map.save(args.mission_map)
+                except Exception as error:
+                    print(f"[Map]: Could not save mission map: {error}")
+                last_map_save = current_time
 
-            draw_status_panel(
+            dashboard_state = get_runtime_state()
+            connections = {
+                "robot": bool(getattr(motion_backend, "connected", False)),
+                "cloud": cloud_available.is_set(),
+                "microphone": microphone_ready,
+                "tts": tts_available.is_set(),
+                "gimbal_status": dashboard_state["gimbal_status"],
+            }
+            preflight = {
+                "tof": motion_status["sensor_ready"],
+                "motion_opt_in": args.enable_motion,
+                "cloud": connections["cloud"],
+                "microphone": connections["microphone"],
+                "tts": connections["tts"],
+            }
+            dashboard_frame = dashboard.render(
                 frame,
-                get_runtime_state(),
                 detections,
-                guidance,
-                annotation_scale,
+                dashboard_state,
+                profile,
+                tuple(scenario_catalog),
                 motion_status,
+                navigation,
+                mission_map,
                 lego_model_status,
+                connections,
+                preflight,
             )
-            cv2.imshow(preview_window, frame)
+            cv2.imshow(preview_window, dashboard_frame)
+            preview_rendered = True
 
             key = cv2.waitKey(1) & 0xFF
+            if not preview_window_is_visible(preview_window):
+                motion_controller.emergency_stop("preview window closed")
+                print("[Safety]: Preview window closed; motion stopped.")
+                break
             global_talk_pressed = global_voice_hotkey_pressed()
             global_stop_pressed = global_emergency_stop_pressed()
-
-            if key in (ord("e"), ord("E"), 27) or global_stop_pressed:
-                motion_controller.emergency_stop("operator emergency stop")
-                play_beep(400, 300)
-                speak("Emergency stop activated.")
-                continue
-
-            if key in (ord("r"), ord("R")):
-                motion_controller.reset_emergency_stop()
-                speak("Emergency stop reset. Motion remains disarmed.")
-                continue
-
-            if key in (ord("m"), ord("M")):
-                if motion_controller.armed:
-                    motion_controller.disarm()
-                    speak("Autonomous motion disarmed.")
-                elif motion_controller.arm():
-                    speak("Autonomous motion armed at low speed.")
-                else:
-                    speak(f"Motion not armed. {motion_controller.last_reason}.")
-                continue
-
             if key in (ord("q"), ord("Q")):
                 break
 
+            actions = dashboard.consume_actions()
+            if key in (ord("e"), ord("E"), 27) or global_stop_pressed:
+                actions.insert(0, {"type": "estop"})
+            if key in (ord("r"), ord("R")):
+                actions.append({"type": "reset_estop"})
+            if key in (ord("m"), ord("M")):
+                actions.append({"type": "arm_toggle"})
             if key in SCENARIO_KEYS:
-                scenario_id = SCENARIO_KEYS[key]
-                if motion_controller.armed:
-                    motion_controller.disarm("scenario changed; re-arm required")
-                with state_lock:
-                    runtime_state["scenario_id"] = scenario_id
-                    if scenario_id == "target" and labels:
-                        runtime_state["target_label"] = (
-                            "person" if "person" in labels else labels[0]
+                actions.append({"type": "scenario", "value": SCENARIO_KEYS[key]})
+            if key in (ord("v"), ord("V"), ord(" ")) or global_talk_pressed:
+                actions.append({"type": "talk"})
+            if key in (ord("t"), ord("T")):
+                actions.append({"type": "next_target"})
+            if key in (ord("n"), ord("N")):
+                actions.append({"type": "toggle_narration"})
+            if key in (ord("p"), ord("P")):
+                actions.append({"type": "toggle_pause"})
+            if key in (ord("w"), ord("W")):
+                actions.append({"type": "add_waypoint"})
+            if key in (ord("h"), ord("H")):
+                actions.append({"type": "return_home"})
+            if key in (ord("l"), ord("L")):
+                actions.append({"type": "read_objects"})
+            if key in (ord("s"), ord("S")):
+                dashboard.show_scenario_menu = True
+                actions.append({"type": "open_scenarios"})
+
+            for action in actions:
+                action_type = action["type"]
+                current_state = get_runtime_state()
+                if action_type == "estop":
+                    motion_controller.emergency_stop("operator emergency stop")
+                    dashboard.add_event("EMERGENCY STOP activated", "danger")
+                    play_beep(400, 300)
+                    speak("Emergency stop activated.")
+                elif action_type == "reset_estop":
+                    if not dashboard.teacher_mode:
+                        speak("Only teacher mode can reset the emergency stop.")
+                    elif motion_controller.status()["mode"] != "ESTOP":
+                        speak("The emergency stop is not latched.")
+                    elif motion_controller.reset_emergency_stop():
+                        dashboard.add_event("Emergency stop reset")
+                        speak("Emergency stop reset. Motion remains disarmed.")
+                    else:
+                        dashboard.add_event("Emergency reset failed", "danger")
+                        speak(
+                            f"Emergency reset failed. {motion_controller.last_reason}."
                         )
-                    elif scenario_id == "lego":
+                elif action_type == "arm_toggle":
+                    current_profile = get_scenario_profile(
+                        current_state["scenario_id"]
+                    )
+                    if motion_controller.armed:
+                        motion_controller.disarm()
+                        dashboard.add_event("Autonomous motion disarmed")
+                        speak("Autonomous motion disarmed.")
+                    elif not dashboard.teacher_mode:
+                        speak("Only teacher mode can arm autonomous motion.")
+                    elif current_state["mission_paused"] or dashboard.show_scenario_menu:
+                        speak("Resume the mission and close the scenario menu before arming.")
+                    elif not current_profile.allow_motion:
+                        speak("This scenario is observation only and cannot be armed.")
+                    elif motion_controller.arm():
+                        dashboard.add_event("Autonomous motion armed", "danger")
+                        speak("Autonomous motion armed at low speed.")
+                    else:
+                        speak(f"Motion not armed. {motion_controller.last_reason}.")
+                elif action_type == "open_scenarios":
+                    motion_controller.disarm("scenario menu opened; re-arm required")
+                    with state_lock:
+                        runtime_state["mission_paused"] = True
+                    dashboard.add_event("Scenario menu opened")
+                elif action_type == "scenario":
+                    scenario_id = action["value"]
+                    selected_profile = get_scenario_profile(scenario_id)
+                    motion_controller.disarm("scenario changed; re-arm required")
+                    target_label = selected_profile.preferred_target
+                    if not target_label and selected_profile.target_labels:
+                        target_label = selected_profile.target_labels[0]
+                    if not target_label and selected_profile.navigation_policy == "lego":
                         lego_labels = [
                             label for label in labels if is_lego_target_label(label)
                         ]
-                        if lego_labels:
-                            runtime_state["target_label"] = lego_labels[0]
-                last_guidance = None
-                speak(f"Mission mode: {SCENARIOS[scenario_id]['name']}.")
-                continue
-
-            if key in (ord("v"), ord("V"), ord(" ")) or global_talk_pressed:
-                request_voice_turn(state, labels)
-                continue
-
-            if key in (ord("t"), ord("T")):
-                target_choices = labels
-                if state["scenario_id"] == "lego":
+                        target_label = lego_labels[0] if lego_labels else None
+                    elif not target_label:
+                        target_label = current_state["target_label"]
+                    with state_lock:
+                        runtime_state["scenario_id"] = scenario_id
+                        runtime_state["target_label"] = target_label
+                        runtime_state["mission_paused"] = False
+                    navigator.select_target(target_label)
+                    dashboard.show_scenario_menu = False
+                    dashboard.add_event(f"Mission selected: {selected_profile.name}")
+                    motion_controller.logger.record(
+                        "scenario_selected",
+                        scenario=scenario_id,
+                        target=target_label,
+                    )
+                    last_guidance = None
+                    speak(
+                        f"Mission mode: {selected_profile.name}. "
+                        f"Objective: {selected_profile.objective}"
+                    )
+                elif action_type == "toggle_pause":
+                    paused = not current_state["mission_paused"]
+                    if paused:
+                        motion_controller.disarm("mission paused; re-arm required")
+                    with state_lock:
+                        runtime_state["mission_paused"] = paused
+                    dashboard.add_event("Mission paused" if paused else "Mission resumed")
+                    speak(
+                        "Mission paused."
+                        if paused
+                        else "Mission resumed. Motion remains disarmed."
+                    )
+                elif action_type == "talk":
+                    request_voice_turn(current_state, labels)
+                elif action_type == "read_objects":
+                    speak(f"I can currently see {format_spoken_list(labels)}.")
+                elif action_type in ("next_target", "select_target"):
+                    current_profile = get_scenario_profile(
+                        current_state["scenario_id"]
+                    )
+                    if current_profile.navigation_policy not in (
+                        "target",
+                        "lego",
+                        "rescue",
+                    ):
+                        speak("This mission does not use a selectable visual target.")
+                        continue
                     target_choices = [
-                        label for label in labels if is_lego_target_label(label)
+                        label
+                        for label in labels
+                        if profile_accepts_target(current_profile, label)
                     ]
-                new_target = cycle_target(state["target_label"], target_choices)
-                if motion_controller.armed:
+                    if action_type == "select_target":
+                        new_target = action["value"]
+                        selected_item = action.get("detection")
+                        if not profile_accepts_target(current_profile, new_target):
+                            dashboard.add_event(
+                                f"Target not allowed in this mission: {new_target}",
+                                "danger",
+                            )
+                            speak(
+                                f"{new_target} is not an allowed target in "
+                                f"{current_profile.name}."
+                            )
+                            continue
+                    else:
+                        if not target_choices:
+                            speak("No selectable targets are currently visible.")
+                            continue
+                        new_target = cycle_target(
+                            current_state["target_label"],
+                            target_choices,
+                        )
+                        selected_item = None
                     motion_controller.disarm("target changed; re-arm required")
-                with state_lock:
-                    runtime_state["target_label"] = new_target
-                last_guidance = None
-                speak(f"Selected target: {new_target}.")
-                continue
-
-            if key in (ord("n"), ord("N")):
-                with state_lock:
-                    runtime_state["auto_narration"] = not runtime_state[
-                        "auto_narration"
-                    ]
-                    narration_enabled = runtime_state["auto_narration"]
-                speak(
-                    "Automatic narration on."
-                    if narration_enabled
-                    else "Automatic narration off."
-                )
+                    with state_lock:
+                        runtime_state["target_label"] = new_target
+                    navigator.select_target(new_target, selected_item)
+                    dashboard.add_event(f"Target selected: {new_target}")
+                    motion_controller.logger.record(
+                        "target_selected",
+                        scenario=current_profile.id,
+                        target=new_target,
+                    )
+                    last_guidance = None
+                    speak(f"Selected target: {new_target}.")
+                elif action_type == "add_waypoint":
+                    if not dashboard.teacher_mode:
+                        speak("Only teacher mode can record waypoints.")
+                    else:
+                        waypoint = mission_map.add_waypoint(
+                            f"Waypoint {len(mission_map.waypoints) + 1}",
+                            motion_status["position"],
+                        )
+                        motion_controller.logger.record(
+                            "waypoint_recorded",
+                            name=waypoint.name,
+                            x=waypoint.x,
+                            y=waypoint.y,
+                        )
+                        try:
+                            mission_map.save(args.mission_map)
+                        except Exception as error:
+                            dashboard.add_event("Waypoint map save failed", "danger")
+                            speak(f"Waypoint recorded in memory, but map save failed: {error}.")
+                        else:
+                            dashboard.add_event(f"Recorded {waypoint.name}")
+                            speak(f"Recorded {waypoint.name}.")
+                elif action_type == "return_home":
+                    motion_controller.disarm("return-home selected; re-arm required")
+                    if not dashboard.teacher_mode:
+                        speak("Only teacher mode can start return to base.")
+                    elif "return_home" not in scenario_catalog:
+                        dashboard.add_event("Return-home profile unavailable", "danger")
+                        speak("The loaded scenario file has no return-home profile.")
+                    elif mission_map.home is None:
+                        speak("No home position has been recorded yet.")
+                    else:
+                        with state_lock:
+                            runtime_state["scenario_id"] = "return_home"
+                            runtime_state["mission_paused"] = False
+                        dashboard.show_scenario_menu = False
+                        dashboard.add_event("Return-home mission selected")
+                        motion_controller.logger.record(
+                            "scenario_selected",
+                            scenario="return_home",
+                            target=None,
+                        )
+                        speak("Return to base selected. Check the map and re-arm manually.")
+                elif action_type == "toggle_narration":
+                    with state_lock:
+                        runtime_state["auto_narration"] = not runtime_state[
+                            "auto_narration"
+                        ]
+                        narration_enabled = runtime_state["auto_narration"]
+                    speak(
+                        "Automatic narration on."
+                        if narration_enabled
+                        else "Automatic narration off."
+                    )
+                elif action_type == "toggle_tts_mute":
+                    with state_lock:
+                        runtime_state["tts_muted"] = not runtime_state["tts_muted"]
+                        muted = runtime_state["tts_muted"]
+                    dashboard.add_event("TTS muted" if muted else "TTS unmuted")
+                    if not muted:
+                        speak("Text to speech unmuted.")
+                elif action_type == "tts_rate":
+                    with state_lock:
+                        runtime_state["tts_rate"] = max(
+                            90,
+                            min(220, runtime_state["tts_rate"] + action["value"]),
+                        )
+                        rate = runtime_state["tts_rate"]
+                    dashboard.add_event(f"TTS rate: {rate}")
+                    speak(f"Speech rate {rate}.")
+                elif action_type == "tts_volume":
+                    with state_lock:
+                        runtime_state["tts_volume"] = max(
+                            0.0,
+                            min(
+                                1.0,
+                                runtime_state["tts_volume"] + action["value"],
+                            ),
+                        )
+                        volume = runtime_state["tts_volume"]
+                    dashboard.add_event(f"TTS volume: {round(volume * 100)}%")
+                    speak(f"Speech volume {round(volume * 100)} percent.")
+                elif action_type == "toggle_role":
+                    with state_lock:
+                        runtime_state["ui_role"] = action["value"]
+                    if action["value"] == "student" and motion_controller.armed:
+                        motion_controller.disarm("student mode selected; re-arm required")
+                    dashboard.add_event(f"UI role: {action['value']}")
     finally:
-        if lego_detector is not None:
-            lego_detector.close()
-        motion_controller.emergency_stop("application shutdown")
-        motion_controller.close()
-        atexit.unregister(motion_controller.close)
         shutdown_event.set()
-        sd.stop()
+        try:
+            motion_controller.emergency_stop("application shutdown")
+        except Exception as error:
+            print(f"[Safety]: Emergency shutdown command failed: {error}")
+        try:
+            motion_controller.close()
+        except Exception as error:
+            print(f"[Safety]: Motion backend cleanup failed: {error}")
+        try:
+            atexit.unregister(motion_controller.close)
+        except Exception:
+            pass
+        try:
+            mission_map.save(args.mission_map)
+        except Exception as error:
+            print(f"[Map]: Could not save mission map during shutdown: {error}")
+        if lego_detector is not None:
+            try:
+                lego_detector.close()
+            except Exception as error:
+                print(f"[LEGO Model]: Cleanup failed: {error}")
+        try:
+            sd.stop()
+        except Exception:
+            pass
         for work_queue in (voice_requests, scene_requests, speech_queue):
             try:
                 work_queue.put_nowait(None)
             except queue.Full:
                 pass
-
-        sct.close()
-        cv2.destroyAllWindows()
+        for worker in workers:
+            worker.join(timeout=1)
+        if openai_client is not None:
+            try:
+                openai_client.close()
+            except Exception:
+                pass
+        try:
+            sct.close()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
         for worker in workers:
             worker.join(timeout=2)
 

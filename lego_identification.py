@@ -135,6 +135,7 @@ class AsyncLegoIdentificationDetector:
         self._latest = []
         self._latest_at = float("-inf")
         self._last_submit = float("-inf")
+        self._generation = 0
         self._error = None
         self._worker = threading.Thread(
             target=self._run,
@@ -161,7 +162,12 @@ class AsyncLegoIdentificationDetector:
                 detections = self.detector.detect(frame, force=True)
                 completed_at = time.monotonic()
                 with self._lock:
-                    self._latest = detections
+                    self._generation += 1
+                    observation_id = f"lego_identification:{self._generation}"
+                    self._latest = [
+                        {**item, "observation_id": observation_id}
+                        for item in detections
+                    ]
                     self._latest_at = completed_at
             except Exception as error:
                 with self._lock:
