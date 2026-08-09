@@ -12,6 +12,9 @@ import threading
 import time
 
 
+VALID_TOF_DIRECTIONS = frozenset(("front", "left", "right", "rear"))
+
+
 @dataclass(frozen=True)
 class MotionCommand:
     forward_mps: float = 0.0
@@ -31,6 +34,7 @@ class SensorSnapshot:
 class MissionLogger:
     def __init__(self, path="mission_events.jsonl"):
         self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
     def record(self, event, **data):
@@ -56,6 +60,7 @@ class DryRunBackend:
         self.distance_updated_at = time.monotonic()
         self.position = (0.0, 0.0, 0.0)
         self.impact = False
+        self.last_gimbal_command = (0.0, 0.0)
 
     def connect(self):
         self.connected = True
@@ -65,6 +70,13 @@ class DryRunBackend:
 
     def stop(self):
         self.last_command = MotionCommand(reason="stopped")
+        self.last_gimbal_command = (0.0, 0.0)
+
+    def drive_gimbal(self, pitch_speed, yaw_speed):
+        self.last_gimbal_command = (float(pitch_speed), float(yaw_speed))
+
+    def stop_gimbal(self):
+        self.last_gimbal_command = (0.0, 0.0)
 
     def snapshot(self):
         return SensorSnapshot(
@@ -97,11 +109,16 @@ class RoboMasterBackend:
         self.robot = None
         self.chassis = None
         self.distance_sensor = None
+        self.gimbal = None
         self._lock = threading.Lock()
         self._distances = ()
         self._distance_updated_at = 0.0
         self._position = (0.0, 0.0, 0.0)
         self._impact = False
+        self._emergency_callback = None
+
+    def set_emergency_callback(self, callback):
+        self._emergency_callback = callback
 
     def connect(self):
         try:
@@ -116,6 +133,7 @@ class RoboMasterBackend:
         self.robot.initialize(conn_type=self.conn_type)
         self.chassis = self.robot.chassis
         self.distance_sensor = self.robot.sensor
+        self.gimbal = getattr(self.robot, "gimbal", None)
 
         if not self.chassis.sub_position(
             cs=1, freq=10, callback=self._on_position
@@ -147,8 +165,14 @@ class RoboMasterBackend:
         impact = len(status) >= 9 and any(bool(value) for value in status[6:9])
         if impact:
             with self._lock:
+                newly_latched = not self._impact
                 self._impact = True
-            self.stop()
+            if not newly_latched:
+                return
+            if self._emergency_callback is not None:
+                self._emergency_callback("hardware impact detected")
+            else:
+                self.stop()
 
     def drive_speed(self, x, y, z, timeout=0.35):
         if not self.connected:
@@ -156,8 +180,33 @@ class RoboMasterBackend:
         self.chassis.drive_speed(x=x, y=y, z=z, timeout=timeout)
 
     def stop(self):
+        # Stop both actuators even if one SDK call fails.  In particular, a
+        # disconnected chassis must never prevent a still-live gimbal from
+        # receiving its zero-speed command.
+        errors = []
         if self.chassis is not None:
-            self.chassis.drive_speed(x=0, y=0, z=0, timeout=0.2)
+            try:
+                self.chassis.drive_speed(x=0, y=0, z=0, timeout=0.2)
+            except Exception as error:
+                errors.append(f"chassis: {error}")
+        try:
+            self.stop_gimbal()
+        except Exception as error:
+            errors.append(f"gimbal: {error}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def drive_gimbal(self, pitch_speed, yaw_speed):
+        if not self.connected or self.gimbal is None:
+            raise RuntimeError("RoboMaster gimbal is unavailable.")
+        self.gimbal.drive_speed(
+            pitch_speed=float(pitch_speed),
+            yaw_speed=float(yaw_speed),
+        )
+
+    def stop_gimbal(self):
+        if self.gimbal is not None:
+            self.gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
 
     def snapshot(self):
         with self._lock:
@@ -178,7 +227,11 @@ class RoboMasterBackend:
             self._impact = False
 
     def close(self):
-        self.stop()
+        errors = []
+        try:
+            self.stop()
+        except Exception as error:
+            errors.append(f"stop: {error}")
         if self.chassis is not None:
             for unsubscribe in (
                 self.chassis.unsub_position,
@@ -194,8 +247,13 @@ class RoboMasterBackend:
             except Exception:
                 pass
         if self.robot is not None:
-            self.robot.close()
+            try:
+                self.robot.close()
+            except Exception as error:
+                errors.append(f"robot close: {error}")
         self.connected = False
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
 
 class SafetyMotionController:
@@ -212,6 +270,7 @@ class SafetyMotionController:
         rotation_clearance_mm=450,
         max_forward_mps=0.12,
         max_yaw_dps=12.0,
+        max_gimbal_dps=25.0,
         sensor_timeout_s=0.6,
         watchdog_timeout_s=0.7,
         logger=None,
@@ -225,26 +284,43 @@ class SafetyMotionController:
         self.rotation_clearance_mm = rotation_clearance_mm
         self.max_forward_mps = max_forward_mps
         self.max_yaw_dps = max_yaw_dps
+        self.max_gimbal_dps = max_gimbal_dps
         self.sensor_timeout_s = sensor_timeout_s
         self.watchdog_timeout_s = watchdog_timeout_s
         self.logger = logger or MissionLogger()
+
+        if not self.tof_layout:
+            raise ValueError("At least one ToF direction must be configured.")
+        if len(set(self.tof_layout)) != len(self.tof_layout):
+            raise ValueError("ToF direction mappings must be unique.")
+        unsupported = set(self.tof_layout) - VALID_TOF_DIRECTIONS
+        if unsupported:
+            raise ValueError(
+                "Unsupported ToF direction mappings: " + ", ".join(sorted(unsupported))
+            )
+        if not 1 <= self.min_tof_count <= len(self.tof_layout):
+            raise ValueError("min_tof_count must fit the configured ToF layout.")
 
         self.armed = False
         self.emergency_latched = False
         self.last_reason = "motion disabled"
         self.last_command_at = time.monotonic()
         self._closed = threading.Event()
+        self._command_lock = threading.RLock()
         self._watchdog = threading.Thread(
             target=self._watchdog_loop,
             name="motion-watchdog",
             daemon=True,
         )
+        if hasattr(self.backend, "set_emergency_callback"):
+            self.backend.set_emergency_callback(self.emergency_stop)
 
     def connect(self):
-        self.backend.connect()
-        self.last_reason = f"{self.backend.name} connected; press M to arm"
-        self.logger.record("motion_backend_connected", backend=self.backend.name)
-        self._watchdog.start()
+        with self._command_lock:
+            self.backend.connect()
+            self.last_reason = f"{self.backend.name} connected; press M to arm"
+            self.logger.record("motion_backend_connected", backend=self.backend.name)
+            self._watchdog.start()
 
     def _ranges(self, snapshot=None):
         snapshot = snapshot or self.backend.snapshot()
@@ -263,51 +339,82 @@ class SafetyMotionController:
         )
 
     def arm(self):
-        snapshot = self.backend.snapshot()
-        if not self.motion_requested:
-            self.last_reason = "restart with --enable-motion before arming"
-            return False
-        if self.emergency_latched:
-            self.last_reason = "emergency stop latched; press R to reset"
-            return False
-        if not self.sensor_ready(snapshot):
-            self.stop("ToF safety check failed", latch=False)
-            return False
+        with self._command_lock:
+            snapshot = self.backend.snapshot()
+            if not self.motion_requested:
+                self.last_reason = "restart with --enable-motion before arming"
+                return False
+            if self.emergency_latched:
+                self.last_reason = "emergency stop latched; press R to reset"
+                return False
+            if not self.sensor_ready(snapshot):
+                self.stop("ToF safety check failed", latch=False)
+                return False
 
-        self.armed = True
-        self.last_command_at = time.monotonic()
-        self.last_reason = "armed"
-        self.logger.record(
-            "motion_armed",
-            backend=self.backend.name,
-            distances_mm=list(snapshot.distances_mm),
-        )
-        return True
+            self.armed = True
+            self.last_command_at = time.monotonic()
+            self.last_reason = "armed"
+            self.logger.record(
+                "motion_armed",
+                backend=self.backend.name,
+                distances_mm=list(snapshot.distances_mm),
+            )
+            return True
 
     def disarm(self, reason="operator disarmed"):
-        self.armed = False
-        self.backend.stop()
-        self.last_reason = reason
-        self.logger.record("motion_disarmed", reason=reason)
+        with self._command_lock:
+            was_armed = self.armed
+            self.armed = False
+            self.last_reason = reason
+            self._send_stop_locked(reason)
+            if was_armed:
+                self.logger.record("motion_disarmed", reason=self.last_reason)
 
     def stop(self, reason="stop", latch=False):
-        self.backend.stop()
-        self.last_reason = reason
-        if latch:
+        with self._command_lock:
+            already_latched = self.emergency_latched
+            self.last_reason = reason
+            if latch:
+                # Latch controller state before attempting an SDK call that may fail.
+                self.armed = False
+                self.emergency_latched = True
+            self._send_stop_locked(reason)
+            if latch and not already_latched:
+                self.logger.record("emergency_stop", reason=self.last_reason)
+
+    def _send_stop_locked(self, reason):
+        try:
+            self.backend.stop()
+            return True
+        except Exception as error:
+            already_latched = self.emergency_latched
             self.armed = False
             self.emergency_latched = True
-            self.logger.record("emergency_stop", reason=reason)
+            self.last_reason = f"{reason}; stop command failed: {error}"
+            if not already_latched:
+                self.logger.record("emergency_stop", reason=self.last_reason)
+            return False
 
     def emergency_stop(self, reason="operator emergency stop"):
         self.stop(reason, latch=True)
 
     def reset_emergency_stop(self):
-        self.backend.stop()
-        self.backend.clear_impact()
-        self.armed = False
-        self.emergency_latched = False
-        self.last_reason = "emergency reset; press M to arm"
-        self.logger.record("emergency_reset")
+        with self._command_lock:
+            if not self.emergency_latched:
+                return False
+            self.armed = False
+            if not self._send_stop_locked("emergency reset failed"):
+                return False
+            try:
+                self.backend.clear_impact()
+            except Exception as error:
+                self.emergency_latched = True
+                self.last_reason = f"impact reset failed: {error}"
+                return False
+            self.emergency_latched = False
+            self.last_reason = "emergency reset; press M to arm"
+            self.logger.record("emergency_reset")
+            return True
 
     @staticmethod
     def _person_too_close(detections, frame_shape):
@@ -324,86 +431,155 @@ class SafetyMotionController:
         return False
 
     def apply(self, command, detections, frame_shape):
-        self.last_command_at = time.monotonic()
-        snapshot = self.backend.snapshot()
+        with self._command_lock:
+            self.last_command_at = time.monotonic()
+            snapshot = self.backend.snapshot()
 
-        if snapshot.impact:
-            self.emergency_stop("impact detected")
-            return MotionCommand(reason=self.last_reason)
-        if not self.armed:
-            self.backend.stop()
-            return MotionCommand(reason=self.last_reason)
-        if not self.sensor_ready(snapshot):
-            self.emergency_stop("ToF data missing or stale")
-            return MotionCommand(reason=self.last_reason)
+            if self.emergency_latched:
+                return MotionCommand(reason=self.last_reason)
+            if snapshot.impact:
+                self.emergency_stop("impact detected")
+                return MotionCommand(reason=self.last_reason)
+            if not self.armed:
+                return MotionCommand(reason=self.last_reason)
+            if not self.sensor_ready(snapshot):
+                self.emergency_stop("ToF data missing or stale")
+                return MotionCommand(reason=self.last_reason)
 
-        ranges = self._ranges(snapshot)
-        forward = max(-self.max_forward_mps, min(self.max_forward_mps, command.forward_mps))
-        lateral = max(-self.max_forward_mps, min(self.max_forward_mps, command.lateral_mps))
-        yaw = max(-self.max_yaw_dps, min(self.max_yaw_dps, command.yaw_dps))
+            ranges = self._ranges(snapshot)
+            forward = max(
+                -self.max_forward_mps,
+                min(self.max_forward_mps, command.forward_mps),
+            )
+            lateral = max(
+                -self.max_forward_mps,
+                min(self.max_forward_mps, command.lateral_mps),
+            )
+            yaw = max(-self.max_yaw_dps, min(self.max_yaw_dps, command.yaw_dps))
 
-        if forward > 0:
-            front_distance = ranges.get("front", 0)
-            required_clearance = self.wall_clearance_mm
-            if any(item.get("label") == "person" for item in detections):
-                required_clearance = max(required_clearance, self.person_clearance_mm)
-            if front_distance < required_clearance:
+            if forward > 0:
+                front_distance = ranges.get("front", 0)
+                required_clearance = self.wall_clearance_mm
+                if any(item.get("label") == "person" for item in detections):
+                    required_clearance = max(
+                        required_clearance,
+                        self.person_clearance_mm,
+                    )
+                if front_distance < required_clearance:
+                    self.stop(
+                        f"forward blocked at {front_distance:.0f} mm",
+                        latch=False,
+                    )
+                    return MotionCommand(reason=self.last_reason)
+                if self._person_too_close(detections, frame_shape):
+                    self.stop("visual person safety stop", latch=False)
+                    return MotionCommand(reason=self.last_reason)
+            elif forward < 0 and ranges.get("rear", 0) < self.wall_clearance_mm:
+                rear_distance = ranges.get("rear", 0)
                 self.stop(
-                    f"forward blocked at {front_distance:.0f} mm",
+                    f"reverse blocked at {rear_distance:.0f} mm",
                     latch=False,
                 )
                 return MotionCommand(reason=self.last_reason)
-            if self._person_too_close(detections, frame_shape):
-                self.stop("visual person safety stop", latch=False)
+
+            side = "left" if lateral > 0 else "right"
+            if lateral and ranges.get(side, 0) < self.wall_clearance_mm:
+                side_distance = ranges.get(side, 0)
+                self.stop(
+                    f"{side} movement blocked at {side_distance:.0f} mm",
+                    latch=False,
+                )
                 return MotionCommand(reason=self.last_reason)
 
-        if yaw and min(ranges.values(), default=0) < self.rotation_clearance_mm:
-            nearest = min(ranges.values(), default=0)
-            self.stop(f"rotation blocked at {nearest:.0f} mm", latch=False)
-            return MotionCommand(reason=self.last_reason)
+            if yaw and min(ranges.values(), default=0) < self.rotation_clearance_mm:
+                nearest = min(ranges.values(), default=0)
+                self.stop(f"rotation blocked at {nearest:.0f} mm", latch=False)
+                return MotionCommand(reason=self.last_reason)
 
-        safe_command = MotionCommand(forward, lateral, yaw, command.reason)
-        try:
-            self.backend.drive_speed(
-                x=safe_command.forward_mps,
-                y=safe_command.lateral_mps,
-                z=safe_command.yaw_dps,
-                timeout=0.35,
+            safe_command = MotionCommand(forward, lateral, yaw, command.reason)
+            try:
+                self.backend.drive_speed(
+                    x=safe_command.forward_mps,
+                    y=safe_command.lateral_mps,
+                    z=safe_command.yaw_dps,
+                    timeout=0.35,
+                )
+                self.last_reason = safe_command.reason
+                return safe_command
+            except Exception as error:
+                self.emergency_stop(f"motion command failed: {error}")
+                return MotionCommand(reason=self.last_reason)
+
+    def apply_gimbal(self, pitch_dps, yaw_dps):
+        """Send a bounded gimbal command under the asynchronous safety lock."""
+        with self._command_lock:
+            if self.emergency_latched or not self.armed:
+                return False
+            pitch = max(
+                -self.max_gimbal_dps,
+                min(self.max_gimbal_dps, float(pitch_dps)),
             )
-            self.last_reason = safe_command.reason
-            return safe_command
-        except Exception as error:
-            self.emergency_stop(f"motion command failed: {error}")
-            return MotionCommand(reason=self.last_reason)
+            yaw = max(
+                -self.max_gimbal_dps,
+                min(self.max_gimbal_dps, float(yaw_dps)),
+            )
+            try:
+                self.backend.drive_gimbal(pitch, yaw)
+                return True
+            except Exception as error:
+                self.emergency_stop(f"gimbal command failed: {error}")
+                return False
+
+    def stop_gimbal(self):
+        """Stop only the gimbal; failure latches the full emergency stop."""
+        with self._command_lock:
+            try:
+                self.backend.stop_gimbal()
+                return True
+            except Exception as error:
+                self.emergency_stop(f"gimbal stop failed: {error}")
+                return False
 
     def status(self):
-        snapshot = self.backend.snapshot()
-        if self.emergency_latched:
-            mode = "ESTOP"
-        elif self.armed:
-            mode = "ARMED"
-        else:
-            mode = "DISARMED"
-        return {
-            "mode": mode,
-            "backend": self.backend.name,
-            "reason": self.last_reason,
-            "ranges": self._ranges(snapshot),
-            "position": snapshot.position,
-            "sensor_ready": self.sensor_ready(snapshot),
-        }
+        with self._command_lock:
+            snapshot = self.backend.snapshot()
+            if self.emergency_latched:
+                mode = "ESTOP"
+            elif self.armed:
+                mode = "ARMED"
+            else:
+                mode = "DISARMED"
+            return {
+                "mode": mode,
+                "backend": self.backend.name,
+                "reason": self.last_reason,
+                "ranges": self._ranges(snapshot),
+                "position": snapshot.position,
+                "sensor_ready": self.sensor_ready(snapshot),
+            }
 
     def _watchdog_loop(self):
         while not self._closed.wait(0.1):
-            if self.armed and time.monotonic() - self.last_command_at > self.watchdog_timeout_s:
-                self.emergency_stop("motion watchdog timeout")
+            with self._command_lock:
+                if (
+                    self.armed
+                    and time.monotonic() - self.last_command_at
+                    > self.watchdog_timeout_s
+                ):
+                    self.emergency_stop("motion watchdog timeout")
 
     def close(self):
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        self.armed = False
-        self.backend.close()
+        with self._command_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self.armed = False
+            self._send_stop_locked("controller closing")
+            try:
+                self.backend.close()
+            except Exception as error:
+                self.emergency_latched = True
+                self.last_reason = f"backend close failed: {error}"
         if self._watchdog.is_alive():
             self._watchdog.join(timeout=1)
 
@@ -416,10 +592,12 @@ class AutonomousPlanner:
         forward_speed_mps=0.10,
         yaw_speed_dps=10.0,
         patrol_turn_distance_mm=900,
+        target_stop_height_ratio=0.35,
     ):
         self.forward_speed_mps = forward_speed_mps
         self.yaw_speed_dps = yaw_speed_dps
         self.patrol_turn_distance_mm = patrol_turn_distance_mm
+        self.target_stop_height_ratio = target_stop_height_ratio
 
     def _approach(self, detections, target_label, frame_shape):
         targets = [item for item in detections if item.get("label") == target_label]
@@ -427,9 +605,13 @@ class AutonomousPlanner:
             return MotionCommand(yaw_dps=self.yaw_speed_dps, reason=f"scan for {target_label}")
 
         target = max(targets, key=lambda item: item.get("confidence", 0.0))
-        x1, _y1, x2, _y2 = target["box"]
-        frame_width = frame_shape[1]
+        x1, y1, x2, y2 = target["box"]
+        frame_height, frame_width = frame_shape[:2]
         center_x = (x1 + x2) / 2
+        height_ratio = (y2 - y1) / max(frame_height, 1)
+
+        if height_ratio >= self.target_stop_height_ratio:
+            return MotionCommand(reason=f"stop - {target_label} close")
 
         if center_x < frame_width * 0.43:
             return MotionCommand(yaw_dps=self.yaw_speed_dps, reason=f"align left to {target_label}")

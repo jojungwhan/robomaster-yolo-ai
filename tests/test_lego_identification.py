@@ -91,6 +91,11 @@ class LegoIdentificationTests(unittest.TestCase):
             detections[0]["label"],
             "lego_piece_red_rectangle_medium",
         )
+        cached = async_detector.detect(frame)
+        self.assertEqual(
+            cached[0]["observation_id"],
+            detections[0]["observation_id"],
+        )
 
 
 if __name__ == "__main__":

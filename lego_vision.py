@@ -269,7 +269,16 @@ def detect_aruco_lego_markers(frame):
 
     aruco = cv2.aruco
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-    parameters = aruco.DetectorParameters()
+    parameters = None
+    if hasattr(aruco, "DetectorParameters"):
+        try:
+            parameters = aruco.DetectorParameters()
+        except Exception:
+            parameters = None
+    if parameters is None and hasattr(aruco, "DetectorParameters_create"):
+        parameters = aruco.DetectorParameters_create()
+    if parameters is None:
+        return []
 
     if hasattr(aruco, "ArucoDetector"):
         detector = aruco.ArucoDetector(dictionary, parameters)

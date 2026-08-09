@@ -1,0 +1,28 @@
+name: tests
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Compile source
+        run: |
+          python -m py_compile autonomy.py navigation.py dashboard.py scenario_profiles.py lego_vision.py lego_identification.py robomaster_yolo_ai.py
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
