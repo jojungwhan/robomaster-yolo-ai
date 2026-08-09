@@ -1,6 +1,0 @@
--r requirements.txt
-
-# DJI only published the Windows SDK wheel for CPython 3.6-3.8. Keep this local,
-# hash-documented copy so setup does not depend on the DJI GitHub repository or
-# on PyPI retaining the old native wheel. setup_robot_sdk.ps1 creates a 3.8 venv.
-./vendor/robomaster-sdk/windows/robomaster-0.1.1.68-cp38-cp38-win_amd64.whl
